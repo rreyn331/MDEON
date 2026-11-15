@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=mdeon-panel Config
+Comment=Edit the mdeon-panel configuration
+Exec=mdeon-panel-config
+Icon=/usr/share/icons/ExposeAir/apps/scalable/settings.svg
+Terminal=false
+Type=Application
+Categories=Settings;DesktopSettings;
+StartupNotify=true

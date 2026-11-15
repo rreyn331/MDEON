@@ -1,0 +1,11 @@
+Package: mdeon-panel-cairo
+Version: 2026.11.15.1406
+Architecture: amd64
+Maintainer: mdeon <mdeon@example.com>
+Installed-Size: 1615
+Depends: libc6 (>= 2.38), libcairo2 (>= 1.6.4-5~), libgcc-s1 (>= 3.0), libgdk-pixbuf-2.0-0 (>= 2.31.1), libglib2.0-0t64 (>= 2.72.0), libjson-c5 (>= 0.15), libpango-1.0-0 (>= 1.14.0), libpangocairo-1.0-0 (>= 1.14.0), libstdc++6 (>= 13.1), libwayland-client0 (>= 1.20.0), libx11-6, libxcb1, libxkbcommon0 (>= 0.5.0)
+Section: x11
+Priority: optional
+Description: Cairo/C++ desktop panel with mdeon-panel configuration
+ A Cairo and C++ desktop panel with X11 and Wayland backends, a Cairo/X11
+ configuration editor, and the original mdeon-panel plugin definitions.

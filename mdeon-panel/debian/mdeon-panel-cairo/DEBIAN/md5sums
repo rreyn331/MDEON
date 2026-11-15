@@ -1,0 +1,9 @@
+d752cafba536f9355ba1e89ab5a9ca3c  usr/bin/mdeon-panel
+cbfe794d9418e13ccadca1ded09d35d8  usr/bin/mdeon-panel-config
+eddb2d0ac6707fc9f6ab56e5fbb99d83  usr/share/applications/mdeon-panel-config.desktop
+53da623efe14a67230a0e321190da0a8  usr/share/doc/mdeon-panel-cairo/changelog.gz
+87356c4f9e1eae2e256af7c4c532800e  usr/share/gnome-shell/extensions/install-mdeon-panel-gnome-system.sh
+2f384ab5dad8905789bd70ca6328fd8e  usr/share/gnome-shell/extensions/install-mdeon-panel-gnome.sh
+638ad60d1063514a42d717e07524aeba  usr/share/gnome-shell/extensions/mdeon-panel-window-manager@roy/extension.js
+028331a9de47bc5e861fec8dcb1c250c  usr/share/gnome-shell/extensions/mdeon-panel-window-manager@roy/metadata.json
+a49d71302ee438d5a5f6246d5ba955d6  usr/share/mdeon-panel/config-example.conf

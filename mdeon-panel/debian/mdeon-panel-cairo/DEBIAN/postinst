@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+schema_dir=/usr/share/glib-2.0/schemas
+schema_override="$schema_dir/99-mdeon-panel-gnome-extension.gschema.override"
+
+if [ -d "$schema_dir" ] && command -v glib-compile-schemas >/dev/null 2>&1; then
+    printf '[org.gnome.shell]\nenabled-extensions=[\047mdeon-panel-window-manager@roy\047]\ndisable-extension-version-validation=true\n' > "$schema_override"
+    if [ -f "$schema_dir/org.gnome.shell.gschema.xml" ]; then
+        glib-compile-schemas "$schema_dir"
+    fi
+fi
+
+exit 0

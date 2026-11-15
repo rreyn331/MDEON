@@ -1,0 +1,16 @@
+Source: mdeon-panel-cairo
+Section: x11
+Priority: optional
+Maintainer: mdeon <mdeon@example.com>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.22), g++, pkg-config,
+ libcairo2-dev, libpango1.0-dev, libxcb1-dev, libx11-dev, libglib2.0-dev,
+ libgdk-pixbuf-2.0-dev, libwayland-dev, wayland-protocols, libxkbcommon-dev
+Standards-Version: 4.6.0
+Rules-Requires-Root: no
+
+Package: mdeon-panel-cairo
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Cairo/C++ desktop panel with mdeon-panel configuration
+ A Cairo and C++ desktop panel with X11 and Wayland backends, a Cairo/X11
+ configuration editor, and the original mdeon-panel plugin definitions.

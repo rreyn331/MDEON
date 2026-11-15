@@ -1,0 +1,8 @@
+{
+  "uuid": "mdeon-panel-window-manager@roy",
+  "name": "Mdeon Panel Window Manager Bridge",
+  "description": "Expose GNOME controls and native Wayland panel placement to mdeon-panel.",
+  "version": 7,
+  "session-modes": ["user", "mdeon"],
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"]
+}

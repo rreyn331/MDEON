@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="plasma_shell">
+  <interface name="org_kde_plasma_shell" version="1">
+    <request name="get_surface">
+      <arg name="id" type="new_id" interface="org_kde_plasma_surface"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+  </interface>
+  <interface name="org_kde_plasma_surface" version="1">
+    <request name="destroy" type="destructor"/>
+    <request name="set_output">
+      <arg name="output" type="object" interface="wl_output"/>
+    </request>
+    <request name="set_position">
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+    </request>
+    <request name="set_role">
+      <arg name="role" type="uint"/>
+    </request>
+  </interface>
+</protocol>
