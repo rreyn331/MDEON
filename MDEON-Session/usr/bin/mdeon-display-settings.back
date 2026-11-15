@@ -1,0 +1,2271 @@
+#!/usr/bin/env python3
+"""
+MDEON Ultra-Lightweight Display Settings (Zero-Toolkit Edition)
+- Rendering: Pure PyCairo (Zero GTK/Qt GUI widgets)
+- Native 64-bit X11 & Native Wayland (pywayland SHM buffer)
+- Left vertical scrollable output list + 2-layer control card (compact screen friendly)
+- Complete CLI commands & Multi-monitor assistant engine
+"""
+
+import argparse
+import configparser
+import ctypes
+import errno
+import fcntl
+import hashlib
+import io
+import json
+import logging
+import math
+import mmap
+import os
+from pathlib import Path
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import warnings
+
+import cairo
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+logging.basicConfig(
+    level=logging.DEBUG if os.environ.get("MDEON_DEBUG") == "1" else logging.INFO,
+    format="[MDEON-DISPLAY] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger("mdeon-display")
+
+# ---------------------------------------------------------------------------
+# Constants & Process Setup
+# ---------------------------------------------------------------------------
+APP_NAME = "mdeon-display-settings"
+APP_VERSION = "0.9.5-cairo"
+
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", ""))
+if not str(CONFIG_HOME) or not CONFIG_HOME.is_absolute():
+    CONFIG_HOME = Path.home() / ".config"
+CONFIG_DIR = CONFIG_HOME / APP_NAME
+CONFIG_FILE = CONFIG_DIR / "config.json"
+INSTANCE_LOCK_PATH = Path(
+    os.environ.get("XDG_RUNTIME_DIR", f"/tmp/mdeon-display-settings-{os.getuid()}")
+) / "mdeon-display-settings.lock"
+_instance_lock = None
+
+ROLLBACK_SECONDS_DEFAULT = 15
+MIN_OUTPUT_SCALE = 0.05
+MAX_OUTPUT_SCALE = 16.0
+
+CAP_ENABLE = "enable"
+CAP_MODE = "mode"
+CAP_REFRESH = "refresh"
+CAP_POSITION = "position"
+CAP_SCALE = "scale"
+CAP_ROTATION = "rotation"
+CAP_PRIMARY = "primary"
+CAP_MIRROR = "mirror"
+
+ALL_CAPABILITIES = frozenset({
+    CAP_ENABLE, CAP_MODE, CAP_REFRESH, CAP_POSITION,
+    CAP_SCALE, CAP_ROTATION, CAP_PRIMARY,
+})
+
+SCALE_PRESETS = [
+    "0.5", "0.6", "0.7", "0.75", "0.8", "0.85", "0.9", "0.95",
+    "1.0", "1.1", "1.2", "1.25", "1.3", "1.4", "1.5", "1.6",
+    "1.75", "2.0"
+]
+
+ROTATION_PRESETS = ["normal", "right", "inverted", "left"]
+
+MONITOR_ASSISTANT_LAYOUT_PRESETS = [
+    "extend-right",
+    "extend-left",
+    "extend-above",
+    "extend-below",
+    "mirror",
+    "single",
+]
+
+DRY_RUN = False
+COMMAND_PREVIEW = []
+
+
+def set_process_name(name="mdeon-display-settings"):
+    name = Path(__file__).name
+    sys.argv[0] = name
+    try:
+        libc = ctypes.cdll.LoadLibrary("libc.so.6")
+        libc.prctl.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        libc.prctl(15, name.encode("utf-8"), 0, 0, 0)
+    except Exception:
+        pass
+    try:
+        import setproctitle
+        setproctitle.setproctitle(name)
+    except ImportError:
+        pass
+
+
+set_process_name()
+
+# ---------------------------------------------------------------------------
+# System DPI / UI Scaling Detection
+# ---------------------------------------------------------------------------
+def detect_ui_scale():
+    for var in ("GDK_SCALE", "ELM_SCALE", "QT_SCALE_FACTOR"):
+        val = os.environ.get(var)
+        if val:
+            try:
+                s = float(val)
+                if s > 0:
+                    return s
+            except ValueError:
+                pass
+
+    if shutil.which("xrdb"):
+        try:
+            res = subprocess.run(
+                ["xrdb", "-query"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=0.5
+            )
+            for line in res.stdout.splitlines():
+                if "Xft.dpi:" in line:
+                    dpi = float(line.split(":")[1].strip())
+                    return max(1.0, round(dpi / 96.0, 2))
+        except Exception:
+            pass
+
+    return 1.0
+
+
+UI_SCALE = detect_ui_scale()
+
+
+def S(val):
+    return int(round(val * UI_SCALE))
+
+
+def create_loading_surface(width, height):
+    surface = cairo.ImageSurface(cairo.FORMAT_RGB24, width, height)
+    cr = cairo.Context(surface)
+    cr.set_source_rgb(0.13, 0.14, 0.16)
+    cr.paint()
+    cr.set_source_rgb(0.95, 0.95, 0.95)
+    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(S(16))
+    cr.move_to(S(24), height // 2)
+    cr.show_text("MDEON Display Settings")
+    cr.set_source_rgb(0.60, 0.62, 0.65)
+    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+    cr.set_font_size(S(12))
+    cr.move_to(S(24), height // 2 + S(24))
+    cr.show_text("Detecting displays...")
+    surface.flush()
+    return surface
+
+
+# ---------------------------------------------------------------------------
+# X11 64-bit ctypes Definitions
+# ---------------------------------------------------------------------------
+try:
+    x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    x11.XDefaultScreen.restype = ctypes.c_int
+    x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+    x11.XRootWindow.restype = ctypes.c_ulong
+    x11.XRootWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDefaultVisual.restype = ctypes.c_void_p
+    x11.XDefaultVisual.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDefaultDepth.restype = ctypes.c_int
+    x11.XDefaultDepth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XCreateSimpleWindow.restype = ctypes.c_ulong
+    x11.XCreateSimpleWindow.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_ulong
+    ]
+    x11.XCreateGC.restype = ctypes.c_void_p
+    x11.XCreateGC.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+    x11.XCreateImage.restype = ctypes.c_void_p
+    x11.XCreateImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_int,
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int
+    ]
+    x11.XPutImage.restype = ctypes.c_int
+    x11.XPutImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint
+    ]
+    x11.XSelectInput.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long]
+    x11.XMapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XPending.restype = ctypes.c_int
+    x11.XPending.argtypes = [ctypes.c_void_p]
+    x11.XNextEvent.restype = ctypes.c_int
+    x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XChangeProperty.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int
+    ]
+    x11.XStoreName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_char_p]
+    x11.XSetWMProtocols = x11.XSetWMProtocols
+    x11.XSetWMProtocols.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.c_int]
+except OSError:
+    x11 = None
+
+
+class XEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("pad", ctypes.c_long * 24)]
+
+
+class XButtonEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint), ("button", ctypes.c_uint), ("same_screen", ctypes.c_int)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# General Helpers
+# ---------------------------------------------------------------------------
+def finite_number(value):
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def format_refresh(refresh):
+    if not finite_number(refresh) or float(refresh) <= 0:
+        return ""
+    return f"{float(refresh):.2f}".rstrip("0").rstrip(".")
+
+
+def parse_scale_value(text):
+    value = str(text).strip()
+    if not value:
+        raise RuntimeError("Scale value cannot be empty")
+    try:
+        scale = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise RuntimeError(f"Invalid scale value: {text!r}")
+    if not finite_number(scale) or not (MIN_OUTPUT_SCALE <= scale <= MAX_OUTPUT_SCALE):
+        raise RuntimeError(f"Scale out of range: {scale}")
+    return scale
+
+
+def nearest_scale_preset(scale):
+    try:
+        val = float(scale)
+        return min(SCALE_PRESETS, key=lambda p: abs(float(p) - val))
+    except Exception:
+        return "1.0"
+
+
+def run_command(command):
+    try:
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        stdout, stderr = proc.communicate(timeout=10)
+        return proc.returncode, stdout, stderr
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def run_apply_command(command):
+    if DRY_RUN:
+        logger.info("[DRY-RUN] %s", " ".join(command))
+        COMMAND_PREVIEW.append(" ".join(command))
+        return 0, "", ""
+    return run_command(command)
+
+
+def json_command(command):
+    code, stdout, stderr = run_command(command)
+    if code != 0:
+        raise RuntimeError(stderr.strip() or stdout.strip() or f"{command[0]} failed")
+    try:
+        return json.loads(stdout)
+    except Exception as e:
+        raise RuntimeError(f"Invalid JSON returned: {e}")
+
+
+def load_config():
+    if not CONFIG_FILE.exists():
+        return {"default_profile": "default", "profiles": {}, "apply_profile": "default"}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"default_profile": "default", "profiles": {}, "apply_profile": "default"}
+
+
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = CONFIG_DIR / f".tmp-{os.getpid()}"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=4)
+    os.replace(temp_file, CONFIG_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Output Data Model
+# ---------------------------------------------------------------------------
+class Output:
+    def __init__(self, name):
+        self.name = name
+        self.connected = False
+        self.enabled = False
+        self.primary = False
+        self.x = 0
+        self.y = 0
+        self.width = 0
+        self.height = 0
+        self.crtc_w = 0
+        self.crtc_h = 0
+        self.refresh = 0.0
+        self.scale = 1.0
+        self.rotation = "normal"
+        self.modes = []
+        self.make = ""
+        self.model = ""
+        self.serial = ""
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "connected": self.connected,
+            "enabled": self.enabled,
+            "primary": self.primary,
+            "x": self.x,
+            "y": self.y,
+            "width": self.width,
+            "height": self.height,
+            "refresh": self.refresh,
+            "scale": self.scale,
+            "rotation": self.rotation,
+            "modes": self.modes,
+            "make": self.make,
+            "model": self.model,
+            "serial": self.serial,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        out = cls(data.get("name", "unknown"))
+        out.connected = data.get("connected", False)
+        out.enabled = data.get("enabled", False)
+        out.primary = data.get("primary", False)
+        out.x = data.get("x", 0)
+        out.y = data.get("y", 0)
+        out.width = data.get("width", 0)
+        out.height = data.get("height", 0)
+        out.refresh = data.get("refresh", 0.0)
+        out.scale = data.get("scale", 1.0)
+        out.rotation = data.get("rotation", "normal")
+        out.modes = data.get("modes", [])
+        out.make = data.get("make", "")
+        out.model = data.get("model", "")
+        out.serial = data.get("serial", "")
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Display Control Backends
+# ---------------------------------------------------------------------------
+class XRandRBackend:
+    name = "xrandr"
+    capabilities = ALL_CAPABILITIES | frozenset({CAP_MIRROR})
+
+    def list_outputs(self):
+        code, stdout, stderr = run_command(["xrandr", "-q"])
+        if code != 0:
+            raise RuntimeError(stderr.strip() or "xrandr -q failed")
+
+        outputs = []
+        current = None
+
+        for line in stdout.splitlines():
+            m = re.match(r"^([A-Za-z0-9_-]+)\s+(connected|disconnected)", line)
+            if m:
+                out_name = m.group(1)
+                connected = m.group(2) == "connected"
+                current = Output(out_name)
+                current.connected = connected
+                current.primary = "primary" in line
+
+                m_geom = re.search(r"(\d+)x(\d+)\+(\d+)\+(\d+)", line)
+                if m_geom:
+                    current.enabled = True
+                    current.crtc_w = int(m_geom.group(1))
+                    current.crtc_h = int(m_geom.group(2))
+                    current.x = int(m_geom.group(3))
+                    current.y = int(m_geom.group(4))
+                else:
+                    current.crtc_w = 0
+                    current.crtc_h = 0
+
+                outputs.append(current)
+                continue
+
+            if current and current.connected and line.startswith("   "):
+                m_res = re.match(r"^\s+(\d+)x(\d+)\s+(.+)", line)
+                if m_res:
+                    w, h = int(m_res.group(1)), int(m_res.group(2))
+                    rates = re.findall(r"(\d+(?:\.\d+)?)([*+]*)", m_res.group(3))
+                    for r_str, flags in rates:
+                        rf = float(r_str)
+                        is_cur = "*" in flags
+                        entry = {
+                            "width": w,
+                            "height": h,
+                            "refresh": rf,
+                            "label": f"{w}x{h}@{rf:.1f}Hz",
+                            "current": is_cur,
+                        }
+                        current.modes.append(entry)
+                        if is_cur:
+                            current.width = w
+                            current.height = h
+                            current.refresh = rf
+
+        for out in outputs:
+            if not out.enabled or out.width == 0:
+                out.scale = 1.0
+                continue
+
+            if out.crtc_w > 0:
+                calculated_scale = round(float(out.width) / float(out.crtc_w), 3)
+                preset = nearest_scale_preset(calculated_scale)
+                if abs(float(preset) - calculated_scale) <= 0.04:
+                    out.scale = float(preset)
+                else:
+                    out.scale = calculated_scale
+            else:
+                out.scale = 1.0
+
+        return outputs
+
+    def apply_outputs(self, outputs):
+        cmd = ["xrandr"]
+        for out in outputs:
+            cmd += ["--output", out.name]
+            if not out.enabled:
+                cmd += ["--off"]
+                continue
+
+            cmd += [
+                "--mode", f"{out.width}x{out.height}",
+                "--pos", f"{out.x}x{out.y}",
+                "--rotate", out.rotation,
+            ]
+            if out.refresh > 0:
+                cmd += ["--rate", format_refresh(out.refresh)]
+
+            ui_scale = parse_scale_value(out.scale)
+            randr_scale = round(1.0 / ui_scale, 6)
+            s_str = f"{randr_scale:.6f}".rstrip("0").rstrip(".")
+            cmd += ["--scale", f"{s_str}x{s_str}"]
+
+            if out.primary:
+                cmd += ["--primary"]
+
+        code, stdout, stderr = run_apply_command(cmd)
+        if code != 0:
+            raise RuntimeError(stderr.strip() or "xrandr apply failed")
+
+
+class SwayBackend:
+    name = "sway"
+    capabilities = ALL_CAPABILITIES - frozenset({CAP_PRIMARY})
+
+    def list_outputs(self):
+        data = json_command(["swaymsg", "-t", "get_outputs"])
+        outputs = []
+        for item in data:
+            out = Output(item.get("name", "unknown"))
+            out.connected = not item.get("disabled", False)
+            out.enabled = item.get("active", False)
+            out.scale = float(item.get("scale", 1.0))
+            out.rotation = item.get("transform", "normal")
+
+            rect = item.get("rect", {})
+            out.x = rect.get("x", 0)
+            out.y = rect.get("y", 0)
+
+            cur_mode = item.get("current_mode", {})
+            out.width = cur_mode.get("width", 0)
+            out.height = cur_mode.get("height", 0)
+            out.refresh = float(cur_mode.get("refresh", 0.0)) / 1000.0
+
+            for m in item.get("modes", []):
+                w = m.get("width", 0)
+                h = m.get("height", 0)
+                rf = float(m.get("refresh", 0.0)) / 1000.0
+                out.modes.append({
+                    "width": w, "height": h, "refresh": rf,
+                    "label": f"{w}x{h}@{rf:.1f}Hz",
+                    "current": (w == out.width and h == out.height and abs(rf - out.refresh) < 0.1)
+                })
+            outputs.append(out)
+        return outputs
+
+    def apply_outputs(self, outputs):
+        for out in outputs:
+            cmd = ["swaymsg", "output", out.name]
+            if not out.enabled:
+                cmd += ["disable"]
+            else:
+                cmd += [
+                    "enable",
+                    "mode", f"{out.width}x{out.height}@{format_refresh(out.refresh)}Hz",
+                    "pos", str(out.x), str(out.y),
+                    "scale", str(out.scale),
+                    "transform", out.rotation
+                ]
+            code, stdout, stderr = run_apply_command(cmd)
+            if code != 0:
+                raise RuntimeError(stderr.strip() or f"Sway apply failed for {out.name}")
+
+
+class HyprctlBackend:
+    name = "hyprctl"
+    capabilities = ALL_CAPABILITIES - frozenset({CAP_PRIMARY})
+
+    def list_outputs(self):
+        data = json_command(["hyprctl", "-j", "monitors", "all"])
+        outputs = []
+        for item in data:
+            out = Output(item.get("name", "unknown"))
+            out.connected = not item.get("disabled", False)
+            out.enabled = not item.get("disabled", False)
+            out.width = int(item.get("width", 0))
+            out.height = int(item.get("height", 0))
+            out.refresh = float(item.get("refreshRate", 0.0))
+            out.x = int(item.get("x", 0))
+            out.y = int(item.get("y", 0))
+            out.scale = float(item.get("scale", 1.0))
+            out.make = str(item.get("make", ""))
+            out.model = str(item.get("model", ""))
+
+            for mode_str in item.get("availableModes", []):
+                m = re.match(r"(\d+)x(\d+)@(\d+(?:\.\d+)?)", mode_str)
+                if m:
+                    w, h, r = int(m.group(1)), int(m.group(2)), float(m.group(3))
+                    out.modes.append({
+                        "width": w, "height": h, "refresh": r,
+                        "label": f"{w}x{h}@{r:.1f}Hz",
+                        "current": (w == out.width and h == out.height),
+                    })
+            outputs.append(out)
+        return outputs
+
+    def apply_outputs(self, outputs):
+        for out in outputs:
+            if not out.enabled:
+                rule = f"{out.name},disable"
+            else:
+                rule = (
+                    f"{out.name},{out.width}x{out.height}@{format_refresh(out.refresh)},"
+                    f"{out.x}x{out.y},{out.scale}"
+                )
+            code, stdout, stderr = run_apply_command(["hyprctl", "keyword", "monitor", rule])
+            if code != 0:
+                raise RuntimeError(stderr.strip() or f"hyprctl apply failed for {out.name}")
+
+
+class KScreenBackend:
+    name = "kscreen"
+    capabilities = ALL_CAPABILITIES - frozenset({CAP_PRIMARY, CAP_MIRROR})
+    ROTATIONS = {
+        "1": "normal", "2": "left", "4": "inverted", "8": "right",
+        "normal": "normal", "none": "normal", "left": "left",
+        "inverted": "inverted", "right": "right",
+    }
+
+    def list_outputs(self):
+        code, stdout, stderr = run_command(["kscreen-doctor", "-o"])
+        if code != 0:
+            raise RuntimeError(stderr.strip() or "kscreen-doctor query failed")
+
+        outputs = []
+        current = None
+        for raw_line in stdout.splitlines():
+            line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw_line).strip()
+            match = re.match(r"^\s*Output:\s+(\d+)\s+(\S+)(.*)$", line)
+            if match:
+                if current:
+                    outputs.append(current)
+                output_id, name, flags = match.groups()
+                current = Output(name)
+                current.output_id = output_id
+                current.connected = bool(re.search(r"\bconnected\b", flags, re.I)) and not bool(
+                    re.search(r"\bdisconnected\b", flags, re.I)
+                )
+                current.enabled = bool(re.search(r"\benabled\b", flags, re.I))
+                current.primary = bool(re.search(r"\bprimary\b", flags, re.I))
+                continue
+            if current is None:
+                continue
+
+            if re.search(r"\benabled\b", line, re.I):
+                current.enabled = True
+            if re.search(r"\bconnected\b", line, re.I) and not re.search(r"\bdisconnected\b", line, re.I):
+                current.connected = True
+            if re.search(r"\bprimary\b", line, re.I):
+                current.primary = True
+
+            geometry = re.search(r"Geometry:\s*(-?\d+),(-?\d+)\s+(\d+)x(\d+)", line)
+            if geometry:
+                current.x, current.y = map(int, geometry.groups()[:2])
+                if not current.width or not current.height:
+                    current.width, current.height = map(int, geometry.groups()[2:])
+            scale = re.search(r"Scale:\s*(\d+(?:\.\d+)?)", line)
+            if scale:
+                current.scale = float(scale.group(1))
+            rotation = re.search(r"Rotation:\s*(\w+)", line, re.I)
+            if rotation:
+                current.rotation = self.ROTATIONS.get(rotation.group(1).casefold(), "normal")
+
+            if "Modes:" in line:
+                for mode in re.finditer(
+                    r"(?:(\d+)\s*:\s*)?(\d+)x(\d+)@(\d+(?:\.\d+)?)(?:Hz)?([*!+]*)",
+                    line,
+                ):
+                    mode_id = mode.group(1)
+                    width, height, refresh = int(mode.group(2)), int(mode.group(3)), float(mode.group(4))
+                    is_current = "*" in mode.group(5)
+                    current.modes.append({
+                        "width": width,
+                        "height": height,
+                        "refresh": refresh,
+                        "label": f"{width}x{height}@{refresh:.1f}Hz",
+                        "current": is_current,
+                        "mode_id": mode_id,
+                    })
+                    if is_current:
+                        current.width, current.height, current.refresh = width, height, refresh
+
+        if current:
+            outputs.append(current)
+        if not outputs:
+            detail = stdout.strip() or "no output records returned"
+            raise RuntimeError(f"No outputs parsed from kscreen-doctor: {detail[:500]}")
+        return outputs
+
+    def apply_outputs(self, outputs):
+        current_outputs = self.list_outputs()
+        current_by_name = {out.name: out for out in current_outputs}
+        command = ["kscreen-doctor"]
+        for out in outputs:
+            current = current_by_name.get(out.name)
+            if current is None:
+                raise RuntimeError(f"KScreen output not found: {out.name}")
+            target = f"output.{getattr(current, 'output_id', out.name)}"
+            if not out.enabled:
+                command.append(f"{target}.disable")
+                continue
+
+            matching_modes = [
+                mode for mode in current.modes
+                if mode["width"] == out.width and mode["height"] == out.height
+            ]
+            selected_mode = None
+            if matching_modes:
+                selected_mode = min(
+                    matching_modes,
+                    key=lambda mode: abs(float(mode["refresh"]) - float(out.refresh)),
+                )
+            mode_id = selected_mode.get("mode_id") if selected_mode else None
+            mode_arg = str(mode_id) if mode_id is not None else f"{out.width}x{out.height}"
+            if mode_id is None and out.refresh > 0:
+                mode_arg += f"@{format_refresh(out.refresh)}"
+            command.extend((
+                f"{target}.enable",
+                f"{target}.mode.{mode_arg}",
+                f"{target}.position.{out.x},{out.y}",
+                f"{target}.scale.{out.scale}",
+                f"{target}.rotation.{out.rotation}",
+            ))
+
+        code, stdout, stderr = run_apply_command(command)
+        if code != 0:
+            raise RuntimeError(stderr.strip() or "KScreen apply failed")
+
+
+class MutterBackend:
+    name = "mutter"
+    capabilities = frozenset({CAP_MODE, CAP_REFRESH, CAP_SCALE})
+    BUS_NAME = "org.gnome.Mutter.DisplayConfig"
+    OBJECT_PATH = "/org/gnome/Mutter/DisplayConfig"
+    INTERFACE = "org.gnome.Mutter.DisplayConfig"
+
+    def __init__(self):
+        try:
+            import gi
+            gi.require_version("Gio", "2.0")
+            from gi.repository import Gio, GLib
+        except (ImportError, ValueError) as exc:
+            raise RuntimeError("GNOME Mutter backend requires PyGObject (python3-gi)") from exc
+
+        self.Gio = Gio
+        self.GLib = GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.proxy = Gio.DBusProxy.new_sync(
+            bus,
+            Gio.DBusProxyFlags.NONE,
+            None,
+            self.BUS_NAME,
+            self.OBJECT_PATH,
+            self.INTERFACE,
+            None,
+        )
+
+    def _get_state_variant(self):
+        return self.proxy.call_sync(
+            "GetCurrentState", None, self.Gio.DBusCallFlags.NONE, -1, None
+        )
+
+    @staticmethod
+    def _unpack(value):
+        return value.unpack() if hasattr(value, "unpack") else value
+
+    @classmethod
+    def _property(cls, properties, name, default=None):
+        return cls._unpack(properties.get(name, default))
+
+    def _outputs_from_state(self, state):
+        monitors = state.get_child_value(1)
+        logical_monitors = state.get_child_value(2)
+        active = {}
+
+        for index in range(logical_monitors.n_children()):
+            logical = logical_monitors.get_child_value(index)
+            x = self._unpack(logical.get_child_value(0))
+            y = self._unpack(logical.get_child_value(1))
+            scale = self._unpack(logical.get_child_value(2))
+            transform = self._unpack(logical.get_child_value(3))
+            primary = self._unpack(logical.get_child_value(4))
+            connected = logical.get_child_value(5)
+            for monitor_index in range(connected.n_children()):
+                monitor = connected.get_child_value(monitor_index)
+                connector = self._unpack(monitor.get_child_value(0))
+                mode_id = (
+                    self._unpack(monitor.get_child_value(1))
+                    if monitor.n_children() == 3 else None
+                )
+                active[connector] = (mode_id, x, y, scale, transform, primary)
+
+        outputs = []
+        for index in range(monitors.n_children()):
+            monitor = monitors.get_child_value(index)
+            spec = monitor.get_child_value(0)
+            connector = self._unpack(spec.get_child_value(0))
+            out = Output(connector)
+            out.connected = True
+            out.make = self._unpack(spec.get_child_value(1))
+            out.model = self._unpack(spec.get_child_value(2))
+            out.serial = self._unpack(spec.get_child_value(3))
+
+            current = active.get(connector)
+            if current:
+                mode_id, out.x, out.y, out.scale, transform, out.primary = current
+                out.enabled = True
+                out.rotation = {
+                    0: "normal", 1: "right", 2: "inverted", 3: "left",
+                }.get(transform, "normal")
+
+            modes = monitor.get_child_value(1)
+            for mode_index in range(modes.n_children()):
+                mode = modes.get_child_value(mode_index)
+                mode_id = self._unpack(mode.get_child_value(0))
+                width = self._unpack(mode.get_child_value(1))
+                height = self._unpack(mode.get_child_value(2))
+                refresh = self._unpack(mode.get_child_value(3))
+                mode_properties = self._unpack(mode.get_child_value(6))
+                is_current = bool(
+                    current and (
+                        mode_id == current[0]
+                        if current[0] is not None
+                        else self._property(mode_properties, "is-current", False)
+                    )
+                )
+                out.modes.append({
+                    "width": width,
+                    "height": height,
+                    "refresh": refresh,
+                    "label": f"{width}x{height}@{refresh:.1f}Hz",
+                    "current": is_current,
+                })
+                if is_current:
+                    out.width, out.height, out.refresh = width, height, refresh
+                elif not current and self._property(mode_properties, "is-current", False):
+                    out.width, out.height, out.refresh = width, height, refresh
+            outputs.append(out)
+        return outputs
+
+    def list_outputs(self):
+        return self._outputs_from_state(self._get_state_variant())
+
+    def apply_outputs(self, outputs):
+        state = self._get_state_variant()
+        serial = self._unpack(state.get_child_value(0))
+        current_outputs = {out.name: out for out in self._outputs_from_state(state)}
+        monitor_modes = {}
+        monitor_array = state.get_child_value(1)
+        for index in range(monitor_array.n_children()):
+            monitor = monitor_array.get_child_value(index)
+            spec = monitor.get_child_value(0)
+            connector = self._unpack(spec.get_child_value(0))
+            modes = monitor.get_child_value(1)
+            monitor_modes[connector] = [
+                (
+                    self._unpack(mode.get_child_value(0)),
+                    self._unpack(mode.get_child_value(1)),
+                    self._unpack(mode.get_child_value(2)),
+                    self._unpack(mode.get_child_value(3)),
+                    self._property(self._unpack(mode.get_child_value(6)), "is-current", False),
+                    self._unpack(mode.get_child_value(5)),
+                )
+                for mode_index in range(modes.n_children())
+                for mode in (modes.get_child_value(mode_index),)
+            ]
+
+        targets = {out.name: out for out in outputs}
+        target_mode_ids = {}
+        target_scales = {}
+        for name, out in targets.items():
+            current = current_outputs.get(name)
+            if current is None:
+                raise RuntimeError(f"Mutter output not found: {name}")
+            if (
+                out.enabled != current.enabled
+                or out.x != current.x
+                or out.y != current.y
+                or out.rotation != current.rotation
+                or out.primary != current.primary
+            ):
+                raise RuntimeError("Mutter backend currently supports changing resolution, refresh, and scale only")
+            if not out.enabled:
+                continue
+
+            candidates = [
+                mode for mode in monitor_modes[name]
+                if mode[1] == out.width and mode[2] == out.height
+            ]
+            if not candidates:
+                raise RuntimeError(f"Mode {out.width}x{out.height} not found for {name}")
+            selected = min(
+                candidates,
+                key=lambda mode: abs(mode[3] - out.refresh) if out.refresh > 0 else 0,
+            )
+            if out.refresh > 0 and abs(selected[3] - out.refresh) > 0.5:
+                raise RuntimeError(f"Refresh rate {out.refresh:g}Hz not found for {name} at {out.width}x{out.height}")
+            if selected[5]:
+                supported_scales = [float(scale) for scale in selected[5]]
+                requested_scale = float(out.scale)
+                selected_scale = min(
+                    supported_scales,
+                    key=lambda scale: abs(scale - requested_scale),
+                )
+                if abs(selected_scale - requested_scale) >= 0.001:
+                    logger.warning(
+                        "Scale %gx is not supported for %s at %dx%d; using nearest supported scale %gx",
+                        requested_scale, name, out.width, out.height, selected_scale,
+                    )
+                    out.scale = selected_scale
+            target_mode_ids[name] = selected[0]
+            target_scales[name] = float(out.scale)
+
+        logical_array = state.get_child_value(2)
+        gdbus_logical_monitors = []
+        for index in range(logical_array.n_children()):
+            logical = logical_array.get_child_value(index)
+            connected = logical.get_child_value(5)
+            gdbus_monitors = []
+            logical_scales = set()
+            for monitor_index in range(connected.n_children()):
+                monitor = connected.get_child_value(monitor_index)
+                connector = self._unpack(monitor.get_child_value(0))
+                if connector in target_scales:
+                    logical_scales.add(target_scales[connector])
+                target_mode = target_mode_ids.get(connector)
+                if monitor.n_children() == 4:
+                    if target_mode is None:
+                        target_mode = next(
+                            (mode[0] for mode in monitor_modes.get(connector, []) if mode[4]),
+                            None,
+                        )
+                    if target_mode is None:
+                        raise RuntimeError(f"Could not determine current mode for {connector}")
+                    monitor_properties = "{}"
+                else:
+                    if target_mode is None:
+                        target_mode = self._unpack(monitor.get_child_value(1))
+                    monitor_properties = monitor.get_child_value(2).print_(True)
+                gdbus_monitors.append(
+                    f"({json.dumps(connector)}, {json.dumps(target_mode)}, {monitor_properties})"
+                )
+
+            if len(logical_scales) > 1:
+                raise RuntimeError("Mirrored Mutter outputs must use the same scale")
+            logical_scale = (
+                float(logical_scales.pop())
+                if logical_scales
+                else float(self._unpack(logical.get_child_value(2)))
+            )
+            logical_x = int(self._unpack(logical.get_child_value(0)))
+            logical_y = int(self._unpack(logical.get_child_value(1)))
+            logical_transform = int(self._unpack(logical.get_child_value(3)))
+            logical_primary = bool(self._unpack(logical.get_child_value(4)))
+            primary_text = "true" if logical_primary else "false"
+            scale_text = repr(float(logical_scale))
+            gdbus_logical_monitors.append(
+                f"({logical_x}, {logical_y}, {scale_text}, uint32 {logical_transform}, "
+                f"{primary_text}, [{', '.join(gdbus_monitors)}])"
+            )
+
+        state_properties = self._unpack(state.get_child_value(3))
+        layout_mode = self._property(state_properties, "layout-mode")
+        method = 0 if DRY_RUN else 2
+        apply_properties = (
+            f"{{'layout-mode': <uint32 {int(layout_mode)}>}}"
+            if layout_mode is not None else "{}"
+        )
+        command = [
+            "gdbus", "call", "--session", "--dest", self.BUS_NAME,
+            "--object-path", self.OBJECT_PATH,
+            "--method", f"{self.INTERFACE}.ApplyMonitorsConfig",
+            str(serial),
+            str(method),
+            f"[{', '.join(gdbus_logical_monitors)}]",
+            apply_properties,
+        ]
+        logger.warning(
+            "Mutter apply request: serial=%s method=%s monitors=%s properties=%s",
+            serial, method, command[-2], command[-1],
+        )
+        code, stdout, stderr = run_command(command)
+        if code != 0:
+            raise RuntimeError(stderr.strip() or stdout.strip() or "Mutter configuration apply failed")
+        logger.info("Mutter apply response: %s", stdout.strip())
+
+
+class GenericWlrBackend:
+    name = "wlr-randr"
+    capabilities = ALL_CAPABILITIES - frozenset({CAP_PRIMARY})
+
+    def list_outputs(self):
+        code, stdout, stderr = run_command(["wlr-randr"])
+        if code != 0:
+            raise RuntimeError("wlr-randr query failed")
+        outputs = []
+        current = None
+
+        for line in stdout.splitlines():
+            if not line.startswith(" ") and line.strip():
+                parts = line.split()
+                current = Output(parts[0])
+                current.connected = True
+                outputs.append(current)
+                continue
+            if not current:
+                continue
+            sub = line.strip()
+            if sub.startswith("Enabled:"):
+                current.enabled = "yes" in sub
+            elif sub.startswith("Position:"):
+                m_pos = re.search(r"(\d+),(\d+)", sub)
+                if m_pos:
+                    current.x = int(m_pos.group(1))
+                    current.y = int(m_pos.group(2))
+            elif sub.startswith("Scale:"):
+                m_sc = re.search(r"(\d+(?:\.\d+)?)", sub)
+                if m_sc:
+                    current.scale = float(m_sc.group(1))
+            elif sub.startswith("Transform:"):
+                current.rotation = sub.split()[-1]
+            elif "px, " in sub:
+                m_m = re.match(r"^(\d+)x(\d+)\s+px,\s+(\d+(?:\.\d+)?)\s*Hz(?:\s+\((.+)\))?", sub)
+                if m_m:
+                    w, h, r = int(m_m.group(1)), int(m_m.group(2)), float(m_m.group(3))
+                    flags = m_m.group(4) or ""
+                    is_cur = "current" in flags
+                    current.modes.append({
+                        "width": w, "height": h, "refresh": r,
+                        "label": f"{w}x{h}@{r:.1f}Hz", "current": is_cur
+                    })
+                    if is_cur:
+                        current.width, current.height, current.refresh = w, h, r
+        return outputs
+
+    def apply_outputs(self, outputs):
+        for out in outputs:
+            cmd = ["wlr-randr", "--output", out.name]
+            if not out.enabled:
+                cmd += ["--off"]
+            else:
+                mode = f"{out.width}x{out.height}"
+                if out.refresh > 0:
+                    refresh = f"{float(out.refresh):.6f}".rstrip("0").rstrip(".")
+                    mode += f"@{refresh}Hz"
+                cmd += [
+                    "--on",
+                    "--mode", mode,
+                    "--pos", f"{out.x},{out.y}",
+                    "--scale", str(out.scale),
+                    "--transform", out.rotation,
+                ]
+            code, stdout, stderr = run_apply_command(cmd)
+            if code != 0:
+                raise RuntimeError(stderr.strip() or f"Failed configuring {out.name}")
+
+
+class UnsupportedWaylandBackend:
+    name = "wayland-unavailable"
+    capabilities = frozenset()
+
+    def __init__(self, diagnostics=()):
+        self.diagnostics = diagnostics
+
+    def list_outputs(self):
+        message = (
+            "No supported Wayland display backend responded. "
+            "Supported backends: Hyprland, Sway, KWin, and wlroots."
+        )
+        if self.diagnostics:
+            message += " Backend checks: " + "; ".join(self.diagnostics)
+        raise RuntimeError(message)
+
+    def apply_outputs(self, outputs):
+        self.list_outputs()
+
+
+def is_wayland_session():
+    return bool(
+        os.environ.get("XDG_SESSION_TYPE", "").casefold() == "wayland"
+        or os.environ.get("WAYLAND_DISPLAY")
+        or os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        or os.environ.get("SWAYSOCK")
+    )
+
+
+def is_gnome_session():
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").casefold()
+    session = os.environ.get("DESKTOP_SESSION", "").casefold()
+    return "gnome" in desktop or "gnome" in session
+
+
+def get_backend(preferred="auto"):
+    preferred_backends = {
+        "xrandr": (XRandRBackend, "xrandr"),
+        "sway": (SwayBackend, "swaymsg"),
+        "hyprctl": (HyprctlBackend, "hyprctl"),
+        "kscreen": (KScreenBackend, "kscreen-doctor"),
+        "wlr-randr": (GenericWlrBackend, "wlr-randr"),
+        "mutter": (MutterBackend, None),
+    }
+    if preferred != "auto":
+        backend_class, command = preferred_backends[preferred]
+        if command and not shutil.which(command):
+            raise RuntimeError(f"Display backend command not found: {command}")
+        backend = backend_class()
+        outputs = backend.list_outputs()
+        if not outputs:
+            raise RuntimeError(f"{backend.name} returned no display outputs")
+        return backend
+
+    if is_wayland_session():
+        candidates = []
+        if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            candidates.append((HyprctlBackend, "hyprctl"))
+        if os.environ.get("SWAYSOCK"):
+            candidates.append((SwayBackend, "swaymsg"))
+        if is_gnome_session():
+            candidates.append((MutterBackend, None))
+        candidates.extend((
+            (HyprctlBackend, "hyprctl"),
+            (SwayBackend, "swaymsg"),
+            (GenericWlrBackend, "wlr-randr"),
+            (KScreenBackend, "kscreen-doctor"),
+        ))
+
+        tried = set()
+        diagnostics = []
+        for backend_class, command in candidates:
+            if backend_class in tried:
+                continue
+            tried.add(backend_class)
+            backend = backend_class()
+            if command and not shutil.which(command):
+                diagnostics.append(f"{backend.name}: {command} not found in PATH")
+                continue
+            try:
+                outputs = backend.list_outputs()
+                if outputs:
+                    backend._initial_outputs = outputs
+                    return backend
+                diagnostics.append(f"{backend.name}: returned no outputs")
+            except Exception as exc:
+                diagnostics.append(f"{backend.name}: {exc}")
+        logger.warning("No Wayland display backend responded: %s", "; ".join(diagnostics))
+        return UnsupportedWaylandBackend(diagnostics)
+
+    if shutil.which("xrandr"):
+        return XRandRBackend()
+    return XRandRBackend()
+
+
+# ---------------------------------------------------------------------------
+# Cairo GUI Engine (Left-Column Responsive Layout)
+# ---------------------------------------------------------------------------
+class CairoDisplaySettingsUI:
+    def __init__(self, width, height, flush_cb, rollback_sec=ROLLBACK_SECONDS_DEFAULT, backend=None):
+        self.width = width
+        self.height = height
+        self.flush_cb = flush_cb
+        self.rollback_duration = rollback_sec
+
+        self.backend = backend if backend is not None else get_backend()
+        self.outputs = []
+        self.selected_output_idx = 0
+        self.sidebar_scroll_y = 0
+
+        self.dropdown_active = None
+        self.dropdown_scroll_offset = 0
+        self.dropdown_rects = []
+        self.dropdown_scrollbar = None
+        self.sidebar_scrollbar = None
+
+        self.rollback_active = False
+        self.rollback_time_left = 0
+        self.rollback_snapshot = None
+        self.rollback_timer_start = 0
+
+        self.assistant_active = False
+        self.status_msg = "Ready"
+        self.close_requested = False
+
+        config = load_config()
+        self.theme = config.get("theme", "light") if isinstance(config, dict) else "light"
+        if self.theme not in ("light", "dark"):
+            self.theme = "light"
+        self._set_theme(self.theme)
+
+        self._init_cairo()
+        self.reload_outputs(initial=True)
+
+    def _set_theme(self, theme):
+        self.theme = theme
+        if theme == "light":
+            self.col_bg = (0.87, 0.88, 0.89)
+            self.col_panel = (0.79, 0.81, 0.83)
+            self.col_card = (0.93, 0.94, 0.95)
+            self.col_accent = (0.56, 0.73, 0.91)
+            self.col_text = (0.12, 0.14, 0.16)
+            self.col_dim = (0.30, 0.32, 0.34)
+            self.col_border = (0.55, 0.58, 0.61)
+            self.col_overlay = (0.72, 0.74, 0.76, 0.55)
+        else:
+            self.col_bg = (0.13, 0.14, 0.16)
+            self.col_panel = (0.18, 0.20, 0.23)
+            self.col_card = (0.22, 0.24, 0.28)
+            self.col_accent = (0.26, 0.52, 0.95)
+            self.col_text = (0.95, 0.95, 0.95)
+            self.col_dim = (0.60, 0.62, 0.65)
+            self.col_border = (0.30, 0.32, 0.36)
+            self.col_overlay = (0.0, 0.0, 0.0, 0.65)
+        self.col_check = self.col_text
+
+    def _card_geometry(self):
+        header_h = S(42)
+        footer_h = S(48)
+        sidebar_w = S(160)
+        main_y = header_h
+        main_h = self.height - header_h - footer_h
+        card_h = min(S(148), main_h - S(16))
+        card_y = main_y + (main_h - card_h) // 2
+        return sidebar_w + S(12), card_y, self.width - sidebar_w - S(24), card_h
+
+    def _init_cairo(self):
+        self.surface = cairo.ImageSurface(cairo.FORMAT_RGB24, self.width, self.height)
+        self.ctx = cairo.Context(self.surface)
+        self.stride = self.surface.get_stride()
+        self.data_buffer = self.surface.get_data()
+
+    def toggle_theme(self):
+        self._set_theme("dark" if self.theme == "light" else "light")
+        try:
+            config = load_config()
+            config["theme"] = self.theme
+            save_config(config)
+            self.status_msg = f"{self.theme.title()} mode enabled."
+        except Exception as exc:
+            self.status_msg = f"{self.theme.title()} mode enabled; preference save failed: {exc}"
+        self.redraw()
+
+    def reload_outputs(self, initial=False):
+        try:
+            if initial and hasattr(self.backend, "_initial_outputs"):
+                self.outputs = self.backend._initial_outputs
+                del self.backend._initial_outputs
+            else:
+                self.outputs = self.backend.list_outputs()
+            if self.outputs and self.selected_output_idx >= len(self.outputs):
+                self.selected_output_idx = 0
+            self.status_msg = f"Detected {len(self.outputs)} monitor(s) [{self.backend.name}]."
+        except Exception as exc:
+            self.status_msg = f"Query error: {exc}"
+
+    def trigger_apply_with_rollback(self):
+        try:
+            self.rollback_snapshot = [
+                Output.from_dict(o.to_dict()) for o in self.backend.list_outputs()
+            ]
+            self.backend.apply_outputs(self.outputs)
+            self.rollback_active = True
+            self.rollback_time_left = self.rollback_duration
+            self.rollback_timer_start = time.monotonic()
+            self.status_msg = "Applied. Awaiting confirmation..."
+        except Exception as exc:
+            logger.exception("Failed to apply display configuration")
+            self.status_msg = f"Apply error: {exc}"
+        self.redraw()
+
+    def confirm_rollback_keep(self):
+        self.rollback_active = False
+        self.rollback_snapshot = None
+        self.status_msg = "Configuration saved successfully."
+        self.redraw()
+
+    def revert_rollback(self):
+        self.rollback_active = False
+        if self.rollback_snapshot:
+            try:
+                self.backend.apply_outputs(self.rollback_snapshot)
+                self.status_msg = "Reverted to previous state."
+            except Exception as e:
+                self.status_msg = f"Revert error: {e}"
+        self.reload_outputs()
+        self.redraw()
+
+    def redraw(self):
+        cr = self.ctx
+        cr.set_source_rgb(*self.col_bg)
+        cr.paint()
+
+        header_h = S(42)
+        footer_h = S(48)
+        sidebar_w = S(160)
+
+        # 1. Header Bar
+        cr.set_source_rgb(*self.col_panel)
+        cr.rectangle(0, 0, self.width, header_h)
+        cr.fill()
+
+        cr.set_source_rgb(*self.col_text)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(S(13))
+        cr.move_to(S(16), S(26))
+        cr.show_text("Mdeon Display")
+
+        cr.set_font_size(S(10))
+        cr.set_source_rgb(*self.col_dim)
+        cr.move_to(S(130), S(26))
+        cr.show_text(f"[{self.backend.name.upper()}]  Scale: {UI_SCALE}x")
+
+        self._draw_btn(self.width - S(212), S(8), S(72), S(26), "Dark" if self.theme == "light" else "Light", accent=False)
+        self._draw_btn(self.width - S(132), S(8), S(68), S(26), "Reload", accent=False)
+        self._draw_btn(self.width - S(60), S(8), S(52), S(26), "Close", accent=False)
+
+        # 2. Left Scrollable Sidebar
+        main_y = header_h
+        main_h = self.height - header_h - footer_h
+
+        cr.set_source_rgb(*self.col_panel)
+        cr.rectangle(0, main_y, sidebar_w, main_h)
+        cr.fill()
+        cr.set_source_rgb(*self.col_border)
+        cr.move_to(sidebar_w, main_y)
+        cr.line_to(sidebar_w, main_y + main_h)
+        cr.stroke()
+
+        # Render output list with scroll clipping
+        cr.save()
+        cr.rectangle(0, main_y, sidebar_w, main_h)
+        cr.clip()
+
+        item_h = S(36)
+        for i, out in enumerate(self.outputs):
+            iy = main_y + S(6) + i * (item_h + S(4)) - self.sidebar_scroll_y
+            is_sel = (i == self.selected_output_idx)
+
+            cr.set_source_rgb(*(self.col_accent if is_sel else self.col_card))
+            cr.rectangle(S(8), iy, sidebar_w - S(16), item_h)
+            cr.fill()
+            cr.set_source_rgb(*self.col_border)
+            cr.rectangle(S(8), iy, sidebar_w - S(16), item_h)
+            cr.stroke()
+
+            # Active/Connected badge
+            cr.set_source_rgb(0.2, 0.8, 0.2 if out.enabled else 0.5)
+            cr.arc(S(20), iy + item_h / 2, S(4), 0, 2 * math.pi)
+            cr.fill()
+
+            cr.set_source_rgb(*self.col_text)
+            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD if is_sel else cairo.FONT_WEIGHT_NORMAL)
+            cr.set_font_size(S(11))
+            cr.move_to(S(32), iy + item_h / 2 + S(4))
+            cr.show_text(out.name[:12])
+        cr.restore()
+
+        content_h = len(self.outputs) * (item_h + S(4)) + S(2)
+        self.sidebar_scrollbar = self._draw_scrollbar(
+            sidebar_w - S(7), main_y, main_h, content_h, main_h, self.sidebar_scroll_y
+        )
+
+        # 3. Main Display Card Area
+        card_x, card_y, card_w, card_h = self._card_geometry()
+
+        if self.outputs and 0 <= self.selected_output_idx < len(self.outputs):
+            out = self.outputs[self.selected_output_idx]
+            self._draw_compact_card(out, card_x, card_y, card_w, card_h)
+
+        # 4. Bottom Action Bar
+        cr.set_source_rgb(*self.col_panel)
+        cr.rectangle(0, self.height - footer_h, self.width, footer_h)
+        cr.fill()
+
+        cr.set_source_rgb(*self.col_dim)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(S(10))
+        cr.move_to(S(14), self.height - S(20))
+        cr.show_text(str(self.status_msg)[:28])
+
+        btn_y = self.height - footer_h + S(8)
+        self._draw_btn(self.width - S(385), btn_y, S(110), S(30), "Assistant")
+        self._draw_btn(self.width - S(270), btn_y, S(60), S(30), "Save")
+        self._draw_btn(self.width - S(205), btn_y, S(75), S(30), "Apply", accent=True)
+        self._draw_btn(self.width - S(125), btn_y, S(115), S(30), "Save + Apply", accent=True)
+
+        if self.dropdown_active:
+            self._draw_dropdown()
+
+        if self.rollback_active:
+            self._draw_rollback_modal()
+
+        if self.assistant_active:
+            self._draw_assistant_modal()
+
+        self.surface.flush()
+        self.flush_cb()
+
+    def _draw_btn(self, x, y, w, h, text, accent=False):
+        cr = self.ctx
+        cr.set_source_rgb(*(self.col_accent if accent else self.col_card))
+        cr.rectangle(x, y, w, h)
+        cr.fill()
+        cr.set_source_rgb(*self.col_border)
+        cr.rectangle(x, y, w, h)
+        cr.stroke()
+
+        cr.set_source_rgb(*self.col_text)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD if accent else cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(S(10))
+        tw = cr.text_extents(text).width
+        cr.move_to(x + (w - tw) / 2, y + h / 2 + S(3.5))
+        cr.show_text(text)
+
+    def _draw_compact_card(self, out, x, y, w, h):
+        cr = self.ctx
+        cr.set_source_rgb(*self.col_card)
+        cr.rectangle(x, y, w, h)
+        cr.fill()
+        cr.set_source_rgb(*self.col_border)
+        cr.rectangle(x, y, w, h)
+        cr.stroke()
+
+        # Output Header Title
+        cr.set_source_rgb(*self.col_text)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(S(13))
+        stat = "Connected" if out.connected else "Disconnected"
+        cr.show_text(f"{out.name} ({stat})")
+
+        # Toggles
+        self._draw_checkbox(x + S(16), y + S(38), "Enabled", out.enabled)
+        self._draw_checkbox(x + S(115), y + S(38), "Primary Display", out.primary)
+
+        # Layer 1: Mode/Resolution (Wide) + Scale
+        row1_y = y + S(68)
+        mode_w = w - S(160)
+        self._draw_label_and_box(x + S(16), row1_y, mode_w, S(28), "Resolution / Refresh", f"{out.width}x{out.height}@{out.refresh:.1f}Hz")
+        self._draw_label_and_box(x + mode_w + S(26), row1_y, S(110), S(28), "Scale", f"{out.scale:.2f}")
+
+        # Layer 2: Rotation + Position X + Position Y
+        row2_y = y + S(112)
+        col_w = int((w - S(48)) / 3)
+        self._draw_label_and_box(x + S(16), row2_y, col_w, S(28), "Rotation", str(out.rotation))
+        self._draw_label_and_box(x + S(16) + col_w + S(8), row2_y, col_w, S(28), "Position X", str(out.x))
+        self._draw_label_and_box(x + S(16) + (col_w + S(8)) * 2, row2_y, col_w, S(28), "Position Y", str(out.y))
+
+    def _draw_checkbox(self, x, y, label, checked):
+        cr = self.ctx
+        sz = S(14)
+        cr.set_source_rgb(*(self.col_accent if checked else self.col_panel))
+        cr.rectangle(x, y, sz, sz)
+        cr.fill()
+        cr.set_source_rgb(*self.col_border)
+        cr.rectangle(x, y, sz, sz)
+        cr.stroke()
+
+        if checked:
+            cr.set_source_rgb(*self.col_check)
+            cr.move_to(x + S(2.5), y + S(9))
+            cr.line_to(x + S(6), y + S(12.5))
+            cr.line_to(x + S(11.5), y + S(2.5))
+            cr.stroke()
+
+        cr.set_source_rgb(*self.col_text)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(S(10))
+        cr.move_to(x + S(20), y + S(11))
+        cr.show_text(label)
+
+    def _draw_label_and_box(self, x, y, w, h, label, value):
+        cr = self.ctx
+        cr.set_source_rgb(*self.col_dim)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(S(9.5))
+        cr.move_to(x, y - S(4))
+        cr.show_text(label)
+
+        cr.set_source_rgb(*self.col_panel)
+        cr.rectangle(x, y, w, h)
+        cr.fill()
+        cr.set_source_rgb(*self.col_border)
+        cr.rectangle(x, y, w, h)
+        cr.stroke()
+
+        cr.set_source_rgb(*self.col_text)
+        cr.set_font_size(S(10.5))
+        cr.move_to(x + S(8), y + S(18))
+        cr.show_text(str(value)[:28])
+
+    def _draw_scrollbar(self, x, y, height, content_extent, viewport_extent, offset):
+        if content_extent <= viewport_extent:
+            return None
+
+        width = S(5)
+        thumb_height = max(S(18), height * viewport_extent / content_extent)
+        max_offset = content_extent - viewport_extent
+        thumb_y = y + (height - thumb_height) * offset / max_offset
+        cr = self.ctx
+        cr.set_source_rgb(*self.col_border)
+        cr.rectangle(x, y, width, height)
+        cr.fill()
+        cr.set_source_rgb(*self.col_accent)
+        cr.rectangle(x, thumb_y, width, thumb_height)
+        cr.fill()
+        return (x, y, width, height, thumb_height, max_offset)
+
+    def _scrollbar_offset_at(self, scrollbar, y):
+        _, track_y, _, track_height, thumb_height, max_offset = scrollbar
+        travel = track_height - thumb_height
+        if travel <= 0:
+            return 0
+        fraction = (y - track_y - thumb_height / 2) / travel
+        return round(max_offset * max(0.0, min(1.0, fraction)))
+
+    def _dropdown_visible_count(self, top_y):
+        row_height = S(24)
+        max_height = max(S(28), min(S(190), self.height - top_y - S(4)))
+        return max(1, int((max_height - S(4)) / row_height))
+
+    def _draw_dropdown(self):
+        cr = self.ctx
+        dtype, items, rx, ry, rw = self.dropdown_active
+        row_height = S(24)
+        max_height = max(S(28), min(S(190), self.height - ry - S(4)))
+        visible_count = self._dropdown_visible_count(ry)
+        visible_items = items[self.dropdown_scroll_offset:self.dropdown_scroll_offset + visible_count]
+        rh = min(len(visible_items) * row_height + S(4), max_height)
+        cr.set_source_rgb(*self.col_panel)
+        cr.rectangle(rx, ry, rw, rh)
+        cr.fill()
+        cr.set_source_rgb(*self.col_accent)
+        cr.rectangle(rx, ry, rw, rh)
+        cr.stroke()
+        self.dropdown_scrollbar = self._draw_scrollbar(
+            rx + rw - S(7), ry + S(4), rh - S(8),
+            len(items) * row_height, rh - S(8), self.dropdown_scroll_offset * row_height,
+        )
+
+        self.dropdown_rects = []
+        for i, item in enumerate(visible_items):
+            iy = ry + S(2) + i * row_height
+            self.dropdown_rects.append((rx, iy, rw, row_height, item))
+            cr.set_source_rgb(*self.col_text)
+            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            cr.set_font_size(S(10))
+            cr.move_to(rx + S(8), iy + S(16))
+            cr.show_text(str(item[0])[:26])
+
+    def _draw_rollback_modal(self):
+        cr = self.ctx
+        cr.set_source_rgba(*self.col_overlay)
+        cr.rectangle(0, 0, self.width, self.height)
+        cr.fill()
+
+        mw, mh = S(380), S(150)
+        mx, my = (self.width - mw) / 2, (self.height - mh) / 2
+        cr.set_source_rgb(*self.col_panel)
+        cr.rectangle(mx, my, mw, mh)
+        cr.fill()
+        cr.set_source_rgb(*self.col_accent)
+        cr.rectangle(mx, my, mw, mh)
+        cr.stroke()
+
+        cr.set_source_rgb(*self.col_text)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(S(13))
+        cr.move_to(mx + S(18), my + S(32))
+        cr.show_text("Confirm Display Settings")
+
+        cr.set_font_size(S(11))
+        cr.set_source_rgb(*self.col_dim)
+        cr.move_to(mx + S(18), my + S(64))
+        cr.show_text(f"Reverting automatically in {self.rollback_time_left} second(s)...")
+
+        self._draw_btn(mx + S(180), my + S(100), S(85), S(30), "Revert", accent=False)
+        self._draw_btn(mx + S(275), my + S(100), S(90), S(30), "Keep", accent=True)
+
+    def _draw_assistant_modal(self):
+        cr = self.ctx
+        cr.set_source_rgba(*self.col_overlay)
+        cr.rectangle(0, 0, self.width, self.height)
+        cr.fill()
+
+        mw, mh = S(420), S(240)
+        mx, my = (self.width - mw) / 2, (self.height - mh) / 2
+        cr.set_source_rgb(*self.col_panel)
+        cr.rectangle(mx, my, mw, mh)
+        cr.fill()
+        cr.set_source_rgb(*self.col_border)
+        cr.rectangle(mx, my, mw, mh)
+        cr.stroke()
+
+        cr.set_source_rgb(*self.col_text)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(S(13))
+        cr.move_to(mx + S(18), my + S(30))
+        cr.show_text("Multi-Monitor Assistant Layouts")
+
+        for idx, preset in enumerate(MONITOR_ASSISTANT_LAYOUT_PRESETS):
+            bx = mx + S(18) + (idx % 2) * S(195)
+            by = my + S(50) + (idx // 2) * S(44)
+            self._draw_btn(bx, by, S(185), S(32), preset)
+
+        self._draw_btn(mx + mw - S(90), my + mh - S(38), S(75), S(26), "Close", accent=False)
+
+    def handle_scroll(self, dy):
+        if self.dropdown_active:
+            items = self.dropdown_active[1]
+            visible_count = self._dropdown_visible_count(self.dropdown_active[3])
+            max_offset = max(0, len(items) - visible_count)
+            direction = 1 if dy > 0 else -1
+            self.dropdown_scroll_offset = max(0, min(max_offset, self.dropdown_scroll_offset + direction))
+            self.redraw()
+            return
+
+        viewport_h = self.height - S(42) - S(48)
+        content_h = len(self.outputs) * S(40) + S(2)
+        max_scroll = max(0, content_h - viewport_h)
+        self.sidebar_scroll_y = max(0, min(max_scroll, self.sidebar_scroll_y + dy))
+        self.redraw()
+
+    def handle_click(self, x, y, button):
+        # Mouse Wheel Support
+        if button == 4:
+            self.handle_scroll(-S(20))
+            return
+        elif button == 5:
+            self.handle_scroll(S(20))
+            return
+
+        if button != 1:
+            return
+
+        if self.width - S(60) <= x <= self.width - S(8) and S(8) <= y <= S(34):
+            self.close_requested = True
+            return
+
+        # Modal Rollback Confirmation
+        if self.rollback_active:
+            mw, mh = S(380), S(150)
+            mx, my = (self.width - mw) / 2, (self.height - mh) / 2
+            if mx + S(180) <= x <= mx + S(265) and my + S(100) <= y <= my + S(130):
+                self.revert_rollback()
+            elif mx + S(275) <= x <= mx + S(365) and my + S(100) <= y <= my + S(130):
+                self.confirm_rollback_keep()
+            return
+
+        # Dropdowns Selection
+        if self.dropdown_active:
+            if self.dropdown_scrollbar:
+                sx, sy, sw, sh, _, _ = self.dropdown_scrollbar
+                if sx <= x <= sx + sw and sy <= y <= sy + sh:
+                    items = self.dropdown_active[1]
+                    visible_count = self._dropdown_visible_count(self.dropdown_active[3])
+                    max_offset = max(0, len(items) - visible_count)
+                    pixel_offset = self._scrollbar_offset_at(self.dropdown_scrollbar, y)
+                    self.dropdown_scroll_offset = max(0, min(max_offset, round(pixel_offset / S(24))))
+                    self.redraw()
+                    return
+            for rx, ry, rw, rh, item in self.dropdown_rects:
+                if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                    dtype = self.dropdown_active[0]
+                    out = self.outputs[self.selected_output_idx]
+                    if dtype == "mode":
+                        out.width, out.height, out.refresh = item[1]
+                        self.status_msg = (
+                            f"Selected {out.width}x{out.height}@{out.refresh:.1f}Hz"
+                        )
+                        logger.info("Selected display mode for %s: %s", out.name, self.status_msg)
+                    elif dtype == "scale":
+                        out.scale = float(item[1])
+                    elif dtype == "rotation":
+                        out.rotation = str(item[1])
+                    self.dropdown_active = None
+                    self.redraw()
+                    return
+            self.dropdown_active = None
+            self.redraw()
+            return
+
+        # Assistant Modal Actions
+        if self.assistant_active:
+            mw, mh = S(420), S(240)
+            mx, my = (self.width - mw) / 2, (self.height - mh) / 2
+            if mx + mw - S(90) <= x <= mx + mw - S(15) and my + mh - S(38) <= y <= my + mh - S(12):
+                self.assistant_active = False
+                self.redraw()
+                return
+
+            for idx, preset in enumerate(MONITOR_ASSISTANT_LAYOUT_PRESETS):
+                bx = mx + S(18) + (idx % 2) * S(195)
+                by = my + S(50) + (idx // 2) * S(44)
+                if bx <= x <= bx + S(185) and by <= y <= by + S(32):
+                    self.apply_assistant_preset(preset)
+                    self.assistant_active = False
+                    self.redraw()
+                    return
+            return
+
+        # Top Bar: Reload Button
+        if self.width - S(212) <= x <= self.width - S(140) and S(8) <= y <= S(34):
+            self.toggle_theme()
+            return
+
+        if self.width - S(132) <= x <= self.width - S(64) and S(8) <= y <= S(34):
+            self.reload_outputs()
+            self.redraw()
+            return
+
+        sidebar_w = S(160)
+        header_h = S(42)
+        footer_h = S(48)
+        main_h = self.height - header_h - footer_h
+
+        # Left Sidebar Selection
+        if 0 <= x <= sidebar_w and header_h <= y <= header_h + main_h:
+            if self.sidebar_scrollbar:
+                sx, sy, sw, sh, _, _ = self.sidebar_scrollbar
+                if sx <= x <= sx + sw and sy <= y <= sy + sh:
+                    self.sidebar_scroll_y = self._scrollbar_offset_at(self.sidebar_scrollbar, y)
+                    self.redraw()
+                    return
+            item_h = S(36)
+            for i in range(len(self.outputs)):
+                iy = header_h + S(6) + i * (item_h + S(4)) - self.sidebar_scroll_y
+                if S(8) <= x <= sidebar_w - S(8) and iy <= y <= iy + item_h:
+                    self.selected_output_idx = i
+                    self.redraw()
+                    return
+
+        # Card Interactive Elements
+        card_x, card_y, card_w, _ = self._card_geometry()
+
+        if self.outputs and 0 <= self.selected_output_idx < len(self.outputs):
+            out = self.outputs[self.selected_output_idx]
+            # Enabled Checkbox
+            if card_x + S(16) <= x <= card_x + S(100) and card_y + S(38) <= y <= card_y + S(56):
+                out.enabled = not out.enabled
+                self.redraw()
+                return
+
+            # Primary Checkbox
+            if card_x + S(115) <= x <= card_x + S(240) and card_y + S(38) <= y <= card_y + S(56):
+                for o in self.outputs:
+                    o.primary = False
+                out.primary = True
+                self.redraw()
+                return
+
+            # Layer 1: Resolution & Scale
+            row1_y = card_y + S(68)
+            mode_w = card_w - S(160)
+
+            # Open Mode Dropdown
+            if card_x + S(16) <= x <= card_x + S(16) + mode_w and row1_y <= y <= row1_y + S(28):
+                modes = [(m["label"], (m["width"], m["height"], m["refresh"])) for m in out.modes]
+                if modes:
+                    self.dropdown_active = ("mode", modes, card_x + S(16), row1_y + S(30), mode_w)
+                    self.dropdown_scroll_offset = 0
+                    self.redraw()
+                    return
+
+            # Open Scale Dropdown
+            if card_x + mode_w + S(26) <= x <= card_x + card_w - S(10) and row1_y <= y <= row1_y + S(28):
+                scales = [(s, float(s)) for s in SCALE_PRESETS]
+                self.dropdown_active = ("scale", scales, card_x + mode_w + S(26), row1_y + S(30), S(110))
+                self.dropdown_scroll_offset = 0
+                self.redraw()
+                return
+
+            # Layer 2: Rotation (Position X, Y are modified by Assistant Layouts)
+            row2_y = card_y + S(112)
+            col_w = int((card_w - S(48)) / 3)
+            if card_x + S(16) <= x <= card_x + S(16) + col_w and row2_y <= y <= row2_y + S(28):
+                rots = [(r, r) for r in ROTATION_PRESETS]
+                self.dropdown_active = ("rotation", rots, card_x + S(16), row2_y + S(30), col_w)
+                self.dropdown_scroll_offset = 0
+                self.redraw()
+                return
+
+        # Bottom Bar Buttons
+        btn_y = self.height - footer_h + S(8)
+        if btn_y <= y <= btn_y + S(30):
+            if self.width - S(385) <= x <= self.width - S(275):
+                self.assistant_active = True
+                self.redraw()
+            elif self.width - S(270) <= x <= self.width - S(210):
+                self.save_current_profile()
+            elif self.width - S(205) <= x <= self.width - S(130):
+                self.trigger_apply_with_rollback()
+            elif self.width - S(125) <= x <= self.width - S(10):
+                self.save_current_profile()
+                self.trigger_apply_with_rollback()
+
+    def apply_assistant_preset(self, preset):
+        if not self.outputs:
+            return
+        logger.info("Applying multi-monitor layout: %s", preset)
+        if preset == "single":
+            for i, o in enumerate(self.outputs):
+                o.enabled = (i == self.selected_output_idx)
+                o.x, o.y = 0, 0
+        elif preset == "extend-right":
+            cur_x = 0
+            for o in self.outputs:
+                if o.enabled:
+                    o.x = cur_x
+                    o.y = 0
+                    cur_x += int(o.width / (o.scale or 1.0))
+        elif preset == "extend-left":
+            total_w = sum(int(o.width / (o.scale or 1.0)) for o in self.outputs if o.enabled)
+            cur_x = total_w
+            for o in self.outputs:
+                if o.enabled:
+                    w = int(o.width / (o.scale or 1.0))
+                    cur_x -= w
+                    o.x = cur_x
+                    o.y = 0
+        elif preset == "extend-above":
+            cur_y = 0
+            for o in self.outputs:
+                if o.enabled:
+                    o.x = 0
+                    o.y = cur_y
+                    cur_y += int(o.height / (o.scale or 1.0))
+        elif preset == "extend-below":
+            cur_y = 0
+            for o in reversed(self.outputs):
+                if o.enabled:
+                    o.x = 0
+                    o.y = cur_y
+                    cur_y += int(o.height / (o.scale or 1.0))
+        elif preset == "mirror":
+            for o in self.outputs:
+                o.x = 0
+                o.y = 0
+
+        self.trigger_apply_with_rollback()
+
+    def save_current_profile(self, name="default"):
+        try:
+            cfg = load_config()
+            cfg["profiles"][name] = {
+                "backend": self.backend.name,
+                "outputs": [o.to_dict() for o in self.outputs],
+            }
+            save_config(cfg)
+            self.status_msg = f"Profile '{name}' saved."
+        except Exception as e:
+            self.status_msg = f"Save failed: {e}"
+        self.redraw()
+
+    def check_timer(self):
+        if self.rollback_active:
+            elapsed = time.monotonic() - self.rollback_timer_start
+            remaining = int(self.rollback_duration - elapsed)
+            if remaining != self.rollback_time_left:
+                self.rollback_time_left = max(0, remaining)
+                if self.rollback_time_left <= 0:
+                    self.revert_rollback()
+                else:
+                    self.redraw()
+
+
+# ---------------------------------------------------------------------------
+# Native 64-Bit X11 Runner
+# ---------------------------------------------------------------------------
+def run_x11(rollback_sec=ROLLBACK_SECONDS_DEFAULT, backend=None):
+    if not x11:
+        raise RuntimeError("libX11.so.6 could not be loaded via ctypes.")
+
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise RuntimeError("Failed to open X11 Display.")
+
+    screen = x11.XDefaultScreen(display)
+    root = x11.XRootWindow(display, screen)
+    visual = x11.XDefaultVisual(display, screen)
+    depth = x11.XDefaultDepth(display, screen)
+
+    # Compact footprint; overflow remains reachable through the scrollbars.
+    width, height = S(560), S(254)
+    win = x11.XCreateSimpleWindow(display, root, 100, 100, width, height, 1, 0, 0xe0e2e4)
+
+    x11.XStoreName(display, win, b"Mdeon Display Settings")
+    atom_class = x11.XInternAtom(display, b"WM_CLASS", 0)
+    x11.XChangeProperty(
+        display, win, atom_class, 31, 8, 0,
+        b"mdeon-display-settings\0mdeon-display-settings\0", 44
+    )
+
+    atom_wm_protocols = x11.XInternAtom(display, b"WM_PROTOCOLS", 0)
+    atom_wm_delete = x11.XInternAtom(display, b"WM_DELETE_WINDOW", 0)
+    protocols = (ctypes.c_ulong * 1)(atom_wm_delete)
+    x11.XSetWMProtocols(display, win, protocols, 1)
+
+    gc = x11.XCreateGC(display, win, 0, None)
+    # Events: ButtonPress (1<<2), Exposure (1<<15), ButtonRelease (1<<3)
+    x11.XSelectInput(display, win, (1 << 2) | (1 << 3) | (1 << 15))
+    x11.XMapWindow(display, win)
+    x11.XFlush(display)
+
+    loading_surface = create_loading_surface(width, height)
+    loading_data = loading_surface.get_data()
+    loading_c_data = (ctypes.c_char * len(loading_data)).from_buffer(loading_data)
+    loading_ximage = x11.XCreateImage(
+        display, visual, depth, 2, 0, ctypes.addressof(loading_c_data),
+        width, height, 32, loading_surface.get_stride()
+    )
+    x11.XPutImage(display, win, gc, loading_ximage, 0, 0, 0, 0, width, height)
+    x11.XFlush(display)
+
+    app = None
+    def flush():
+        x11.XPutImage(display, win, gc, app.ximage, 0, 0, 0, 0, width, height)
+        x11.XFlush(display)
+
+    if backend is None:
+        backend = get_backend()
+    app = CairoDisplaySettingsUI(width, height, flush, rollback_sec, backend)
+
+    app.c_data = (ctypes.c_char * (app.stride * height)).from_buffer(app.data_buffer)
+    app.ximage = x11.XCreateImage(
+        display, visual, depth, 2, 0, ctypes.addressof(app.c_data), width, height, 32, app.stride
+    )
+
+    app.redraw()
+
+    ev = XEvent()
+    last_tick = time.monotonic()
+
+    while True:
+        while x11.XPending(display):
+            x11.XNextEvent(display, ctypes.byref(ev))
+            if ev.type == 12:  # Expose
+                app.redraw()
+            elif ev.type == 4:  # ButtonPress
+                bev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XButtonEvent)).contents
+                app.handle_click(bev.x, bev.y, bev.button)
+            elif ev.type == 33:  # WM_DELETE_WINDOW
+                x11.XCloseDisplay(display)
+                sys.exit(0)
+
+        now = time.monotonic()
+        if now - last_tick >= 0.2:
+            app.check_timer()
+            last_tick = now
+        if app.close_requested:
+            x11.XCloseDisplay(display)
+            return
+        time.sleep(0.02)
+
+
+# ---------------------------------------------------------------------------
+# Native Wayland Runner
+# ---------------------------------------------------------------------------
+def run_wayland(rollback_sec=ROLLBACK_SECONDS_DEFAULT):
+    try:
+        from pywayland.client import Display as WlDisplay
+        try:
+            from pywayland.protocols.wayland import WlCompositor, WlShm, WlSeat
+            from pywayland.protocols.wlr_layer_shell_unstable_v1 import ZwlrLayerShellV1
+        except ImportError:
+            from pywayland.protocol.wayland import WlCompositor, WlShm, WlSeat, WlSurface
+            from pywayland.protocol_core import Argument, ArgumentType, Interface, Proxy
+
+            class ZwlrLayerShellV1(Interface):
+                name = "zwlr_layer_shell_v1"
+                version = 4
+
+            class ZwlrLayerSurfaceV1(Interface):
+                name = "zwlr_layer_surface_v1"
+                version = 4
+
+            class ZwlrLayerShellV1Proxy(Proxy):
+                interface = ZwlrLayerShellV1
+
+                @ZwlrLayerShellV1.request(
+                    Argument(ArgumentType.NewId, interface=ZwlrLayerSurfaceV1),
+                    Argument(ArgumentType.Object, interface=WlSurface),
+                    Argument(ArgumentType.Object, interface=None, nullable=True),
+                    Argument(ArgumentType.Uint),
+                    Argument(ArgumentType.String),
+                )
+                def get_layer_surface(self, surface, output, layer, namespace):
+                    return self._marshal_constructor(
+                        0, ZwlrLayerSurfaceV1, surface, output, layer, namespace
+                    )
+
+            class ZwlrLayerSurfaceV1Proxy(Proxy):
+                interface = ZwlrLayerSurfaceV1
+
+                @ZwlrLayerSurfaceV1.request(
+                    Argument(ArgumentType.Uint), Argument(ArgumentType.Uint)
+                )
+                def set_size(self, width, height):
+                    self._marshal(0, width, height)
+
+                @ZwlrLayerSurfaceV1.request(Argument(ArgumentType.Uint))
+                def set_anchor(self, anchor):
+                    self._marshal(1, anchor)
+
+                @ZwlrLayerSurfaceV1.request(Argument(ArgumentType.Int))
+                def set_exclusive_zone(self, zone):
+                    self._marshal(2, zone)
+
+                @ZwlrLayerSurfaceV1.request(
+                    Argument(ArgumentType.Int),
+                    Argument(ArgumentType.Int),
+                    Argument(ArgumentType.Int),
+                    Argument(ArgumentType.Int),
+                )
+                def set_margin(self, top, right, bottom, left):
+                    self._marshal(3, top, right, bottom, left)
+
+                @ZwlrLayerSurfaceV1.request(Argument(ArgumentType.Uint))
+                def set_keyboard_interactivity(self, keyboard_interactivity):
+                    self._marshal(4, keyboard_interactivity)
+
+                @ZwlrLayerSurfaceV1.request(
+                    Argument(ArgumentType.Object, interface=None)
+                )
+                def get_popup(self, popup):
+                    self._marshal(5, popup)
+
+                @ZwlrLayerSurfaceV1.request(Argument(ArgumentType.Uint))
+                def ack_configure(self, serial):
+                    self._marshal(6, serial)
+
+                @ZwlrLayerSurfaceV1.request()
+                def destroy(self):
+                    self._marshal(7)
+                    self._destroy()
+
+                @ZwlrLayerSurfaceV1.request(
+                    Argument(ArgumentType.Uint), version=2
+                )
+                def set_layer(self, layer):
+                    self._marshal(8, layer)
+
+                @ZwlrLayerSurfaceV1.event(
+                    Argument(ArgumentType.Uint),
+                    Argument(ArgumentType.Uint),
+                    Argument(ArgumentType.Uint),
+                )
+                def configure(self, serial, width, height):
+                    self._post_event(0, serial, width, height)
+
+                @ZwlrLayerSurfaceV1.event()
+                def closed(self):
+                    self._post_event(1)
+
+            ZwlrLayerShellV1._gen_c()
+            ZwlrLayerShellV1.proxy_class = ZwlrLayerShellV1Proxy
+            ZwlrLayerSurfaceV1._gen_c()
+            ZwlrLayerSurfaceV1.proxy_class = ZwlrLayerSurfaceV1Proxy
+    except ImportError:
+        logger.warning("pywayland layer-shell missing; falling back to X11.")
+        return run_x11(rollback_sec)
+
+    wl_display = WlDisplay()
+    wl_display.connect()
+    registry = wl_display.get_registry()
+
+    state = {"comp": None, "shm": None, "shell": None, "seat": None, "pointer": None}
+
+    def reg_global(reg, id_, iface, ver):
+        if iface == "wl_compositor":
+            state["comp"] = reg.bind(id_, WlCompositor, min(ver, 4))
+        elif iface == "wl_shm":
+            state["shm"] = reg.bind(id_, WlShm, 1)
+        elif iface == "zwlr_layer_shell_v1":
+            state["shell"] = reg.bind(id_, ZwlrLayerShellV1, min(ver, 4))
+        elif iface == "wl_seat":
+            state["seat"] = reg.bind(id_, WlSeat, min(ver, 5))
+
+    registry.dispatcher["global"] = reg_global
+    wl_display.roundtrip()
+
+    if not state["shell"]:
+        logger.warning("ZwlrLayerShellV1 unsupported; falling back to X11.")
+        return run_x11(rollback_sec)
+
+    width, height = S(560), S(254)
+    surface = state["comp"].create_surface()
+    layer_surf = state["shell"].get_layer_surface(surface, None, 2, "mdeon-display")
+    layer_surf.set_size(width, height)
+    layer_surf.set_anchor(0)
+    layer_surf.set_keyboard_interactivity(0)
+
+    stride = width * 4
+    size = stride * height
+    fd = os.memfd_create("mdeon-display-cairo", os.MFD_CLOEXEC) if hasattr(os, "memfd_create") else tempfile.TemporaryFile().fileno()
+    os.ftruncate(fd, size)
+    mapping = mmap.mmap(fd, size, access=mmap.ACCESS_WRITE)
+    pool = state["shm"].create_pool(fd, size)
+    wl_buf = pool.create_buffer(0, width, height, stride, WlShm.format.xrgb8888)
+
+    app = None
+    def flush():
+        data = bytes(app.data_buffer)
+        mapping[:len(data)] = data
+        mapping.flush()
+        surface.attach(wl_buf, 0, 0)
+        surface.damage(0, 0, width, height)
+        surface.commit()
+        wl_display.flush()
+
+    def on_configure(ls, serial, w, h):
+        ls.ack_configure(serial)
+        if app is not None:
+            app.redraw()
+
+    layer_surf.dispatcher["configure"] = on_configure
+    surface.commit()
+    wl_display.roundtrip()
+    loading_surface = create_loading_surface(width, height)
+    loading_data = loading_surface.get_data()
+    mapping[:len(loading_data)] = loading_data
+    mapping.flush()
+    surface.attach(wl_buf, 0, 0)
+    surface.damage(0, 0, width, height)
+    surface.commit()
+    wl_display.flush()
+    wl_display.roundtrip()
+
+    backend = get_backend()
+    if backend.name == "kscreen" and os.environ.get("DISPLAY"):
+        layer_surf.destroy()
+        surface.destroy()
+        wl_display.flush()
+        wl_display.disconnect()
+        return run_x11(rollback_sec, backend)
+    app = CairoDisplaySettingsUI(width, height, flush, rollback_sec, backend)
+    app.redraw()
+
+    ptr_pos = [0, 0]
+    def ptr_motion(_p, _time, sx, sy):
+        ptr_pos[:] = [int(sx), int(sy)]
+
+    def ptr_button(_p, _serial, _time, btn, state_val):
+        if state_val == 1:
+            app.handle_click(ptr_pos[0], ptr_pos[1], 1 if btn == 272 else 3)
+
+    def ptr_axis(_p, _time, axis, value):
+        if axis == 0:  # Vertical Scroll
+            app.handle_scroll(S(20) if value > 0 else -S(20))
+
+    if state["seat"]:
+        pointer = state["seat"].get_pointer()
+        pointer.dispatcher["motion"] = ptr_motion
+        pointer.dispatcher["button"] = ptr_button
+        pointer.dispatcher["axis"] = ptr_axis
+
+    last_poll = time.monotonic()
+    while True:
+        if select.select([wl_display.get_fd()], [], [], 0.05)[0]:
+            wl_display.dispatch(block=True)
+        now = time.monotonic()
+        if now - last_poll >= 0.2:
+            app.check_timer()
+            last_poll = now
+        if app.close_requested:
+            layer_surf.destroy()
+            surface.destroy()
+            wl_display.flush()
+            wl_display.disconnect()
+            return
+
+
+# ---------------------------------------------------------------------------
+# CLI Command Line Interface Suite
+# ---------------------------------------------------------------------------
+def acquire_instance_lock():
+    global _instance_lock
+    try:
+        INSTANCE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _instance_lock = open(INSTANCE_LOCK_PATH, "a+")
+        fcntl.flock(_instance_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        logger.warning("Another MDEON Display Settings instance is already running.")
+        return False
+    except OSError as exc:
+        logger.error("Could not acquire display settings instance lock: %s", exc)
+        return False
+
+
+def handle_cli_commands(args, backend):
+    if args.list:
+        outputs = backend.list_outputs()
+        print(f"Backend: {backend.name}")
+        for o in outputs:
+            status = "connected" if o.connected else "disconnected"
+            active = "enabled" if o.enabled else "disabled"
+            print(f"- {o.name}: {status}, {active}, {o.width}x{o.height}@{o.refresh:.1f}Hz, scale {o.scale}, pos ({o.x},{o.y})")
+        return True
+
+    if args.current:
+        outputs = backend.list_outputs()
+        data = {o.name: o.to_dict() for o in outputs}
+        print(json.dumps(data, indent=2))
+        return True
+
+    if args.list_profiles:
+        cfg = load_config()
+        profiles = list(cfg.get("profiles", {}).keys())
+        print("Configured Profiles:")
+        for p in profiles:
+            print(f" - {p}")
+        return True
+
+    if args.apply or args.apply_profile:
+        cfg = load_config()
+        pname = args.apply_profile or cfg.get("apply_profile") or cfg.get("default_profile", "default")
+        if pname not in cfg.get("profiles", {}):
+            print(f"Error: Profile '{pname}' does not exist.", file=sys.stderr)
+            sys.exit(1)
+        prof_data = cfg["profiles"][pname]
+        outputs = [Output.from_dict(d) for d in prof_data.get("outputs", [])]
+        backend.apply_outputs(outputs)
+        print(f"Applied profile '{pname}' successfully.")
+        return True
+
+    if args.save_profile:
+        cfg = load_config()
+        pname = args.save_profile
+        outputs = backend.list_outputs()
+        cfg["profiles"][pname] = {
+            "backend": backend.name,
+            "outputs": [o.to_dict() for o in outputs],
+        }
+        save_config(cfg)
+        print(f"Saved current display setup to profile '{pname}'.")
+        return True
+
+    return False
+
+
+def main():
+    global DRY_RUN
+    parser = argparse.ArgumentParser(prog=APP_NAME, description="Configure displays using pure PyCairo")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate execution without modifying displays")
+    parser.add_argument("--backend", default="auto", choices=["auto", "x11", "wayland"], help="GUI runner backend")
+    parser.add_argument(
+        "--display-backend",
+        default="auto",
+        choices=["auto", "xrandr", "sway", "hyprctl", "kscreen", "wlr-randr", "mutter"],
+        help="Select a display backend for headless CLI commands",
+    )
+    parser.add_argument("--rollback-seconds", type=int, default=ROLLBACK_SECONDS_DEFAULT, help="Confirmation rollback timeout")
+
+    # Headless CLI actions
+    parser.add_argument("--list", action="store_true", help="Print summary of detected monitors and exit")
+    parser.add_argument("--current", action="store_true", help="Dump current monitor geometries as JSON and exit")
+    parser.add_argument("--list-profiles", action="store_true", help="List all saved profile names and exit")
+    parser.add_argument("--apply", action="store_true", help="Apply the configured display profile and exit")
+    parser.add_argument("--apply-profile", type=str, metavar="NAME", help="Apply a saved profile headlessly and exit")
+    parser.add_argument("--save-profile", type=str, metavar="NAME", help="Save current active display layout to profile and exit")
+
+    args = parser.parse_args()
+
+    if args.dry_run:
+        DRY_RUN = True
+
+    if any((args.list, args.current, args.list_profiles, args.apply,
+            args.apply_profile, args.save_profile)):
+        backend = get_backend(args.display_backend)
+        if handle_cli_commands(args, backend):
+            return
+
+    if not acquire_instance_lock():
+        return
+
+    if args.backend == "wayland" or (args.backend == "auto" and is_wayland_session()):
+        if args.backend == "auto" and os.environ.get("DISPLAY"):
+            try:
+                run_x11(args.rollback_seconds)
+                return
+            except Exception as exc:
+                logger.info("XWayland unavailable (%s); trying native Wayland.", exc)
+        try:
+            run_wayland(args.rollback_seconds)
+        except Exception as exc:
+            logger.warning("Wayland launch failed (%s); falling back to X11.", exc)
+            run_x11(args.rollback_seconds)
+    else:
+        run_x11(args.rollback_seconds)
+
+
+if __name__ == "__main__":
+    main()

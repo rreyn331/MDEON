@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=MDEON X11
+Comment=Minimal Desktop Environment, Optimized for Needs - X11
+Exec=/usr/bin/mdeon-session x11
+TryExec=/usr/bin/mdeon-session
+Type=Application
+DesktopNames=MDEON
+Icon=mdeon
+Hidden=false

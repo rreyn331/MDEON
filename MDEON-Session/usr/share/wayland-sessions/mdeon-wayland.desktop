@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=MDEON Wayland
+Comment=Minimal Desktop Environment, Optimized for Needs - Wayland
+Exec=/usr/bin/mdeon-session wayland
+TryExec=/usr/bin/mdeon-session
+Type=Application
+DesktopNames=MDEON
+Icon=mdeon
+Hidden=false

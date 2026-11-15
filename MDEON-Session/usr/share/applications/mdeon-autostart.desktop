@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=MDEON Autostart Manager
+Comment=Manage startup applications for MDEON
+Exec=/usr/bin/mdeon-autostart
+TryExec=/usr/bin/mdeon-autostart
+Icon=session-properties
+Terminal=false
+Type=Application
+Categories=Settings;DesktopSettings;GTK;Utility;
+StartupNotify=true
+StartupWMClass=mdeon-autostart
+Keywords=MDEON;Autostart;Startup;Session;XDG;Login;

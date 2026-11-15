@@ -1,0 +1,34 @@
+#!/bin/sh
+set -e
+
+# Load debconf if needed (optional)
+# . /usr/share/debconf/confmodule
+
+case "$1" in
+    configure)
+        # Register the session manager alternative
+        # Priority 30 is fine; keep it consistent with other window managers
+        update-alternatives --install /usr/bin/x-session-manager \
+            x-session-manager /usr/bin/mdeon-session 30
+
+        # Hide unavailable session entries based on what is actually installed.
+        if command -v mdeon-session-visibility >/dev/null 2>&1; then
+            mdeon-session-visibility
+        fi
+
+        # Ensure permissions (using -f to avoid errors if file is missing)
+        [ -f /etc/mdeon/mdeon.conf.default ] && chmod 644 /etc/mdeon/mdeon.conf.default
+        [ -f /usr/bin/mdeon-session ] && chmod 755 /usr/bin/mdeon-session
+    ;;
+
+    abort-upgrade|abort-deconfigure|abort-remove)
+        # Nothing to do here for this specific setup
+    ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+    ;;
+esac
+
+exit 0

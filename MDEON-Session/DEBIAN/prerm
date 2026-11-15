@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        # Remove the alternative when the package is removed or deconfigured
+        update-alternatives --remove x-session-manager /usr/bin/mdeon-session
+    ;;
+
+    upgrade)
+        # During an upgrade, we usually do nothing here. 
+        # The new version's 'postinst' will overwrite the alternative anyway.
+    ;;
+
+    failed-upgrade)
+    ;;
+
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+    ;;
+esac
+
+exit 0

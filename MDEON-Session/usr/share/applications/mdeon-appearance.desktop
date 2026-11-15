@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=MDEON Appearance
+Comment=Configure themes, icons, cursors, fonts, GTK2, GTK3, GTK4, and window decorations
+Exec=/usr/bin/mdeon-appearance
+TryExec=/usr/bin/mdeon-appearance
+Icon=preferences-desktop-theme
+Terminal=false
+Type=Application
+Categories=Settings;DesktopSettings;GTK;
+StartupNotify=true
+Keywords=MDEON;Appearance;Theme;GTK;GTK2;GTK3;GTK4;Icons;Cursor;Fonts;Window;

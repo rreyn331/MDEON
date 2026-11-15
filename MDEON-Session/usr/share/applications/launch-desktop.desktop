@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=MDEON Desktop Launcher
+Comment=Launch or configure the desktop manager for the current session
+Exec=/usr/bin/launch-desktop
+TryExec=/usr/bin/launch-desktop
+Icon=user-desktop
+Terminal=false
+Type=Application
+Categories=Settings;DesktopSettings;Utility;
+StartupNotify=true
+Keywords=MDEON;Desktop;Manager;Session;FileManager;

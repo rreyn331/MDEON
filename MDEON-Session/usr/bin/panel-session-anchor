@@ -1,0 +1,3 @@
+#!/bin/bash
+#replaces dock command if you don't want a terminal
+sleep infinity

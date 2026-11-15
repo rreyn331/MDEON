@@ -1,0 +1,3401 @@
+#!/usr/bin/env python3
+"""
+MDEON Ultra-Lightweight Desktop Shell (Zero-Toolkit Edition)
+- Rendering: Pure PyCairo + Native librsvg / GdkPixbuf (Zero GTK/Qt GUI widgets)
+- Freedesktop (XDG) Icon Theme Specification matching GTK4/Xfce (Resolves Chrome PWAs via hicolor)
+- Hierarchical "Open With" submenu based on Gio.AppInfo (matching mdeon-desktop.py)
+- Modular: Works across any WM, compositor, file manager, and terminal
+"""
+
+import os
+import io
+import mmap
+import re
+import select
+import sys
+import time
+import math
+import shutil
+import signal
+import ctypes
+import fcntl
+import logging
+import subprocess
+import configparser
+import shlex
+import tempfile
+import warnings
+import json
+from pathlib import Path
+
+import cairo
+from mdeon_theme import ThemedContext, prefers_light_scheme
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+try:
+    import gi
+    gi.require_version('Gio', '2.0')
+    try:
+        gi.require_version('GioUnix', '2.0')
+        from gi.repository import GioUnix
+        DesktopAppInfo = GioUnix.DesktopAppInfo
+    except Exception:
+        from gi.repository import Gio
+        DesktopAppInfo = Gio.DesktopAppInfo
+    from gi.repository import Gio
+    HAVE_GIO = True
+except Exception:
+    HAVE_GIO = False
+
+try:
+    gi.require_version('Rsvg', '2.0')
+    from gi.repository import Rsvg
+    HAVE_RSVG = True
+except Exception:
+    HAVE_RSVG = False
+
+try:
+    from PIL import Image
+    HAVE_PIL = True
+except ImportError:
+    HAVE_PIL = False
+
+WpCursorShapeDeviceV1 = None
+WpCursorShapeManagerV1 = None
+try:
+    from pywayland.protocol.cursor_shape_v1 import (
+        WpCursorShapeDeviceV1,
+        WpCursorShapeManagerV1,
+    )
+except ImportError:
+    try:
+        from pywayland.protocols.cursor_shape_v1 import (
+            WpCursorShapeDeviceV1,
+            WpCursorShapeManagerV1,
+        )
+    except ImportError:
+        pass
+
+try:
+    xkb = ctypes.cdll.LoadLibrary("libxkbcommon.so.0")
+    xkb.xkb_context_new.restype = ctypes.c_void_p
+    xkb.xkb_context_new.argtypes = [ctypes.c_int]
+    xkb.xkb_keymap_new_from_string.restype = ctypes.c_void_p
+    xkb.xkb_keymap_new_from_string.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int
+    ]
+    xkb.xkb_state_new.restype = ctypes.c_void_p
+    xkb.xkb_state_new.argtypes = [ctypes.c_void_p]
+    xkb.xkb_state_key_get_one_sym.restype = ctypes.c_uint32
+    xkb.xkb_state_key_get_one_sym.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    xkb.xkb_state_update_mask.restype = ctypes.c_int
+    xkb.xkb_state_update_mask.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+    ]
+    xkb.xkb_state_mod_name_is_active.restype = ctypes.c_int
+    xkb.xkb_state_mod_name_is_active.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint,
+    ]
+    xkb.xkb_state_unref.argtypes = [ctypes.c_void_p]
+    xkb.xkb_keymap_unref.argtypes = [ctypes.c_void_p]
+except OSError:
+    xkb = None
+
+HAVE_WAYLAND = False
+if os.environ.get("WAYLAND_DISPLAY"):
+    try:
+        from pywayland.client import Display as WlDisplay
+        try:
+            from pywayland.protocols.wayland import (
+                WlBuffer,
+                WlCompositor,
+                WlKeyboard,
+                WlPointer,
+                WlShm,
+                WlShmPool,
+                WlSeat,
+                WlSurface,
+            )
+            from pywayland.protocols.wlr_layer_shell_unstable_v1 import (
+                ZwlrLayerShellV1,
+                ZwlrLayerSurfaceV1,
+            )
+        except ImportError:
+            from pywayland.protocol.wayland import (
+                WlBuffer,
+                WlCompositor,
+                WlKeyboard,
+                WlPointer,
+                WlShm,
+                WlShmPool,
+                WlSeat,
+                WlSurface,
+            )
+            from pywayland.protocol_core import Argument, ArgumentType, Interface, Proxy
+
+            class ZwlrLayerShellV1(Interface):
+                name = "zwlr_layer_shell_v1"
+                version = 4
+
+            class ZwlrLayerSurfaceV1(Interface):
+                name = "zwlr_layer_surface_v1"
+                version = 4
+
+            class ZwlrLayerShellV1Proxy(Proxy):
+                interface = ZwlrLayerShellV1
+
+                @ZwlrLayerShellV1.request(
+                    Argument(ArgumentType.NewId, interface=ZwlrLayerSurfaceV1),
+                    Argument(ArgumentType.Object, interface=WlSurface),
+                    Argument(ArgumentType.Object, interface=None, nullable=True),
+                    Argument(ArgumentType.Uint),
+                    Argument(ArgumentType.String),
+                )
+                def get_layer_surface(self, surface, output, layer, namespace):
+                    return self._marshal_constructor(
+                        0, ZwlrLayerSurfaceV1, surface, output, layer, namespace
+                    )
+
+            class ZwlrLayerSurfaceV1Proxy(Proxy):
+                interface = ZwlrLayerSurfaceV1
+
+                @ZwlrLayerSurfaceV1.request(
+                    Argument(ArgumentType.Uint),
+                    Argument(ArgumentType.Uint),
+                )
+                def set_size(self, width, height):
+                    self._marshal(0, width, height)
+
+                @ZwlrLayerSurfaceV1.request(Argument(ArgumentType.Uint))
+                def set_anchor(self, anchor):
+                    self._marshal(1, anchor)
+
+                @ZwlrLayerSurfaceV1.request(Argument(ArgumentType.Int))
+                def set_exclusive_zone(self, zone):
+                    self._marshal(2, zone)
+
+                @ZwlrLayerSurfaceV1.request(
+                    Argument(ArgumentType.Int),
+                    Argument(ArgumentType.Int),
+                    Argument(ArgumentType.Int),
+                    Argument(ArgumentType.Int),
+                )
+                def set_margin(self, top, right, bottom, left):
+                    self._marshal(3, top, right, bottom, left)
+
+                @ZwlrLayerSurfaceV1.request(Argument(ArgumentType.Uint))
+                def set_keyboard_interactivity(self, keyboard_interactivity):
+                    self._marshal(4, keyboard_interactivity)
+
+                @ZwlrLayerSurfaceV1.request(
+                    Argument(ArgumentType.Object, interface=None)
+                )
+                def get_popup(self, popup):
+                    self._marshal(5, popup)
+
+                @ZwlrLayerSurfaceV1.request(Argument(ArgumentType.Uint))
+                def ack_configure(self, serial):
+                    self._marshal(6, serial)
+
+                @ZwlrLayerSurfaceV1.request()
+                def destroy(self):
+                    self._marshal(7)
+                    self._destroy()
+
+                @ZwlrLayerSurfaceV1.request(
+                    Argument(ArgumentType.Uint), version=2
+                )
+                def set_layer(self, layer):
+                    self._marshal(8, layer)
+
+                @ZwlrLayerSurfaceV1.event(
+                    Argument(ArgumentType.Uint),
+                    Argument(ArgumentType.Uint),
+                    Argument(ArgumentType.Uint),
+                )
+                def configure(self, serial, width, height):
+                    self._post_event(0, serial, width, height)
+
+                @ZwlrLayerSurfaceV1.event()
+                def closed(self):
+                    self._post_event(1)
+
+            ZwlrLayerShellV1._gen_c()
+            ZwlrLayerShellV1.proxy_class = ZwlrLayerShellV1Proxy
+            ZwlrLayerSurfaceV1._gen_c()
+            ZwlrLayerSurfaceV1.proxy_class = ZwlrLayerSurfaceV1Proxy
+
+        HAVE_WAYLAND = True
+    except ImportError:
+        HAVE_WAYLAND = False
+
+logging.basicConfig(
+    level=logging.DEBUG if os.environ.get("MDEON_DEBUG") == "1" else logging.INFO,
+    format="[MDEON] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger("mdeon-cairo")
+
+EVDEV_TO_KEYSYM = {
+    1: 0xff1b,
+    28: 0xff0d,
+    96: 0xff8d,
+    60: 0xffbf,
+    63: 0xffc2,
+    102: 0xff50,
+    103: 0xff52,
+    105: 0xff51,
+    106: 0xff53,
+    107: 0xff57,
+    108: 0xff54,
+    111: 0xffff,
+}
+
+# ----------------------------------------------------------------------
+# Paths, Defaults & Constants
+# ----------------------------------------------------------------------
+SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "x11").lower()
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "mdeon"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))
+
+MDEON_CONF = CONFIG_DIR / "mdeon.conf"
+MDEON_DFLT = Path("/etc/mdeon/mdeon.conf.default")
+DESKTOP_CONF = CONFIG_DIR / "mdeon-desktop.conf"
+DESKTOP_DFLT = Path("/etc/mdeon/mdeon-desktop.conf.default")
+DESKTOP_LAYOUT_CONF = CONFIG_DIR / "desktop-layout.json"
+DESKTOP_CONFIG_BACKUP_COUNT = 2
+
+TRASH_DIR = DATA_DIR / "Trash"
+TRASH_FILES_DIR = TRASH_DIR / "files"
+TRASH_INFO_DIR = TRASH_DIR / "info"
+
+INSTANCE_LOCK_PATH = Path(
+    os.environ.get("XDG_RUNTIME_DIR", f"/tmp/mdeon-desktop-{os.getuid()}")
+) / "mdeon-desktop.lock"
+_instance_lock = None
+
+FILE_MANAGERS = [
+    "thunar", "pcmanfm", "pcmanfm-qt", "spacefm", 
+    "nemo", "caja", "nautilus", "dolphin"
+]
+
+TERMINALS = [
+    "xfce4-terminal", "alacritty", "kitty", "foot", 
+    "tilix", "gnome-terminal", "mate-terminal", "lxterminal", "xterm"
+]
+
+VIRTUAL_ICONS = [
+    ("HOME", "Home Folder", "user-home", "virtual://home"),
+    ("COMPUTER", "Computer", "computer", "virtual://computer"),
+    ("NETWORK", "Network", "network-workgroup", "virtual://network"),
+    ("TRASH", "Recycling Bin", "user-trash", "virtual://trash"),
+    ("BROWSER", "Web Browser", "web-browser", "virtual://browser"),
+]
+
+FALLBACK_MIME_ICONS = {
+    ".iso": ["application-x-cd-image", "media-optical", "media-optical-cd", "media-cdrom"],
+    ".img": ["application-x-raw-disk-image", "media-optical", "drive-removable-media"],
+    ".zip": ["package-x-generic", "application-zip", "archive"],
+    ".tar": ["package-x-generic", "application-x-tar", "archive"],
+    ".gz":  ["package-x-generic", "application-gzip", "archive"],
+    ".xz":  ["package-x-generic", "application-x-xz", "archive"],
+    ".7z":  ["package-x-generic", "application-x-7z-compressed", "archive"],
+    ".pdf": ["application-pdf", "x-office-document"],
+    ".sh":  ["application-x-executable-script", "text-x-script", "text-plain"],
+    ".py":  ["text-x-python", "text-x-script", "text-plain"],
+    ".txt": ["text-x-generic", "text-plain"],
+    ".mp3": ["audio-x-generic", "audio-mp3"],
+    ".flac": ["audio-x-generic"],
+    ".mp4": ["video-x-generic", "video-mp4"],
+    ".mkv": ["video-x-generic"],
+    ".png": ["image-x-generic", "image-png"],
+    ".jpg": ["image-x-generic", "image-jpeg"],
+    ".jpeg": ["image-x-generic", "image-jpeg"],
+}
+
+DESKTOP_CONFIG_DEFAULTS = {
+    "HOME": "false",
+    "COMPUTER": "false",
+    "NETWORK": "false",
+    "TRASH": "true",
+    "BROWSER": "false",
+    "BROWSER_URI": "",
+    "MENU_BG_COLOR": "#2d2d2d",
+    "WALLPAPER": "",
+    "FALLBACK_COLOR": "#222222",
+    "FALLBACK_TERM": "x-terminal-emulator",
+    "ICON_SIZE_PIXELS": "48",
+    "ICON_FONT_SIZE_PIXELS": "15",
+    "ICON_FONT_COLOR": "#ffffff",
+    "ICON_LABEL_WIDTH_CHARS": "10",
+    "ICON_LABEL_MAX_LINES": "2",
+}
+
+
+def load_desktop_layout():
+    defaults = {"default_monitor": None, "wallpapers": {}, "icon_assignments": {}}
+    try:
+        data = json.loads(DESKTOP_LAYOUT_CONF.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            defaults.update(data)
+    except (OSError, ValueError):
+        pass
+    if not isinstance(defaults.get("wallpapers"), dict):
+        defaults["wallpapers"] = {}
+    if not isinstance(defaults.get("icon_assignments"), dict):
+        defaults["icon_assignments"] = {}
+    return defaults
+
+
+def backup_config_file(path):
+    path = Path(path)
+    if not path.is_file() or DESKTOP_CONFIG_BACKUP_COUNT < 1:
+        return
+
+    temporary_backup = path.with_name(f".{path.name}.backup-{os.getpid()}.tmp")
+    try:
+        shutil.copy2(path, temporary_backup)
+        for index in range(DESKTOP_CONFIG_BACKUP_COUNT, 1, -1):
+            previous = path.with_name(f"{path.name}.bak.{index - 1}")
+            rotated = path.with_name(f"{path.name}.bak.{index}")
+            if rotated.exists():
+                rotated.unlink()
+            if previous.exists():
+                os.replace(previous, rotated)
+        os.replace(
+            temporary_backup,
+            path.with_name(f"{path.name}.bak.1"),
+        )
+    except OSError:
+        temporary_backup.unlink(missing_ok=True)
+        raise
+
+
+def save_desktop_layout(layout):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = DESKTOP_LAYOUT_CONF.with_name(f".desktop-layout-{os.getpid()}.tmp")
+    try:
+        backup_config_file(DESKTOP_LAYOUT_CONF)
+        temp_path.write_text(json.dumps(layout, indent=2) + "\n", encoding="utf-8")
+        os.replace(temp_path, DESKTOP_LAYOUT_CONF)
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def get_mutter_active_monitors():
+    if not HAVE_GIO:
+        return []
+    try:
+        connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        reply = connection.call_sync(
+            "org.gnome.Mutter.DisplayConfig",
+            "/org/gnome/Mutter/DisplayConfig",
+            "org.gnome.Mutter.DisplayConfig",
+            "GetCurrentState",
+            None,
+            None,
+            Gio.DBusCallFlags.NONE,
+            3000,
+            None,
+        )
+        _, monitor_data, logical_monitors, _ = reply.unpack()
+        modes_by_connector = {}
+        for spec, modes, _properties in monitor_data:
+            current_mode = next(
+                (mode for mode in modes if mode[-1].get("is-current", False)),
+                None,
+            )
+            if current_mode:
+                modes_by_connector[spec[0]] = (int(current_mode[1]), int(current_mode[2]))
+
+        monitors = []
+        for x, y, scale, transform, primary, specs, _properties in logical_monitors:
+            if not specs:
+                continue
+            width, height = modes_by_connector.get(specs[0][0], (0, 0))
+            if width <= 0 or height <= 0:
+                continue
+            if int(transform) % 4 in (1, 3):
+                width, height = height, width
+            scale = max(float(scale), 1.0)
+            monitors.append({
+                "name": specs[0][0],
+                "x": int(x),
+                "y": int(y),
+                "width": max(1, round(width / scale)),
+                "height": max(1, round(height / scale)),
+                "scale": scale,
+                "primary": bool(primary),
+            })
+        return monitors
+    except Exception as exc:
+        logger.debug("Mutter monitor query unavailable: %s", exc)
+        return []
+
+
+def get_x11_active_monitors():
+    if not os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return []
+    if not shutil.which("xrandr"):
+        return []
+    try:
+        result = subprocess.run(
+            ["xrandr", "--query"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+
+        monitors = []
+        for line in result.stdout.splitlines():
+            output_match = re.match(r"^(\S+)\s+connected\b(.*)$", line)
+            if not output_match:
+                continue
+            name, details = output_match.groups()
+            geometry_match = re.search(
+                r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", details
+            )
+            if not geometry_match:
+                continue
+            width, height, x, y = map(int, geometry_match.groups())
+            monitors.append({
+                "name": name,
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+                "scale": 1.0,
+                "primary": bool(re.search(r"\bprimary\b", details)),
+            })
+        return monitors
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+
+
+def get_active_monitors():
+    """Query active outputs through MDEON's toolkit-independent display CLI."""
+    session_names = " ".join((
+        os.environ.get("XDG_CURRENT_DESKTOP", ""),
+        os.environ.get("XDG_SESSION_DESKTOP", ""),
+        os.environ.get("DESKTOP_SESSION", ""),
+        os.environ.get("MDEON_SESSION_COMPOSITOR", ""),
+    )).casefold()
+    if os.environ.get("WAYLAND_DISPLAY") and any(
+        marker in session_names for marker in ("gnome", "mutter")
+    ):
+        monitors = get_mutter_active_monitors()
+        if monitors:
+            return monitors
+    if os.environ.get("WAYLAND_DISPLAY") and any(
+        marker in session_names for marker in ("kde", "plasma", "kwin")
+    ) and shutil.which("kscreen-doctor"):
+        try:
+            result = subprocess.run(
+                ["kscreen-doctor", "-o"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if result.returncode == 0:
+                monitors = []
+                current = None
+                for line in result.stdout.splitlines():
+                    output_match = re.match(r"^\s*Output:\s+\d+\s+(\S+)(.*)$", line)
+                    if output_match:
+                        if current and current["enabled"] and current["width"] > 0:
+                            monitors.append(current)
+                        name, flags = output_match.groups()
+                        current = {
+                            "name": name,
+                            "x": 0,
+                            "y": 0,
+                            "width": 0,
+                            "height": 0,
+                            "scale": 1.0,
+                            "primary": "primary" in flags.casefold(),
+                            "enabled": "disabled" not in flags.casefold(),
+                        }
+                        continue
+                    if not current:
+                        continue
+                    geometry_match = re.search(
+                        r"Geometry:\s*(-?\d+),(-?\d+)\s+(\d+)x(\d+)", line
+                    )
+                    scale_match = re.search(r"Scale:\s*(\d+(?:\.\d+)?)", line)
+                    if geometry_match:
+                        current["x"], current["y"], current["width"], current["height"] = map(
+                            int, geometry_match.groups()
+                        )
+                    if scale_match:
+                        current["scale"] = float(scale_match.group(1))
+                if current and current["enabled"] and current["width"] > 0:
+                    monitors.append(current)
+                if monitors:
+                    return monitors
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+
+    x11_monitors = get_x11_active_monitors()
+    if x11_monitors:
+        return x11_monitors
+
+    local_cli = Path(__file__).with_name("mdeon-display-settings")
+    cli = shutil.which("mdeon-display-settings")
+    if local_cli.is_file():
+        command = [sys.executable, str(local_cli), "--current"]
+    elif cli:
+        command = [cli, "--current"]
+    else:
+        command = []
+
+    if command:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if result.returncode == 0:
+                outputs = json.loads(result.stdout)
+                if isinstance(outputs, dict):
+                    monitors = []
+                    for name, output in outputs.items():
+                        if not isinstance(output, dict) or not output.get("enabled"):
+                            continue
+                        width = int(output.get("width", 0))
+                        height = int(output.get("height", 0))
+                        if width <= 0 or height <= 0:
+                            continue
+                        scale = max(float(output.get("scale", 1.0)), 0.1)
+                        width = int(output.get("width", 0))
+                        height = int(output.get("height", 0))
+                        is_wlroots = bool(
+                            os.environ.get("SWAYSOCK")
+                            or os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+                            or (
+                                os.environ.get("WAYLAND_DISPLAY")
+                                and shutil.which("wlr-randr")
+                            )
+                        )
+                        if is_wlroots:
+                            width = round(width / scale)
+                            height = round(height / scale)
+                            if str(output.get("rotation", "normal")).casefold() in (
+                                "90", "270", "left", "right"
+                            ):
+                                width, height = height, width
+                        monitors.append({
+                            "name": str(name),
+                            "x": int(output.get("x", 0)),
+                            "y": int(output.get("y", 0)),
+                            "width": width,
+                            "height": height,
+                            "scale": scale,
+                            "primary": bool(output.get("primary", False)),
+                        })
+                    if monitors:
+                        return monitors
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    return []
+
+
+def _is_dbus_service_active(service_name):
+    if not shutil.which("gdbus"):
+        return True
+    try:
+        result = subprocess.run(
+            [
+                "gdbus", "call", "--session",
+                "--dest", "org.freedesktop.DBus",
+                "--object-path", "/org/freedesktop/DBus",
+                "--method", "org.freedesktop.DBus.GetNameOwner",
+                service_name,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.4,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+def sync_external_compositor_wallpaper(wallpaper_path, bg_color_hex):
+    """
+    Overrides external wallpaper settings in KWin (Plasma) and GNOME
+    across both X11 and Wayland sessions using native IPC tools.
+    """
+    # 1. Override GNOME / Mutter desktop background via gsettings
+    if shutil.which("gsettings"):
+        try:
+            file_uri = Path(wallpaper_path).as_uri() if wallpaper_path and os.path.exists(wallpaper_path) else ""
+            if file_uri:
+                subprocess.run(["gsettings", "set", "org.gnome.desktop.background", "picture-uri", file_uri], timeout=0.8, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["gsettings", "set", "org.gnome.desktop.background", "picture-uri-dark", file_uri], timeout=0.8, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["gsettings", "set", "org.gnome.desktop.background", "picture-options", "zoom"], timeout=0.8, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.run(["gsettings", "set", "org.gnome.desktop.background", "picture-options", "none"], timeout=0.8, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if bg_color_hex:
+                subprocess.run(["gsettings", "set", "org.gnome.desktop.background", "primary-color", bg_color_hex], timeout=0.8, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            logger.debug(f"GNOME gsettings sync ignored: {e}")
+
+    # 2. Override KWin / KDE Plasma desktop containment wallpaper via DBus Scripting
+    if not _is_dbus_service_active("org.kde.plasmashell"):
+        return
+
+    plasma_image = json.dumps(
+        wallpaper_path if wallpaper_path and os.path.exists(wallpaper_path) else ""
+    )
+    plasma_color = json.dumps(bg_color_hex or "#2d2d2d")
+    plasma_script = f"""
+    var Desktops = desktops();
+    for (var i = 0; i < Desktops.length; i++) {{
+        var d = Desktops[i];
+        d.wallpaperPlugin = "org.kde.image";
+        d.currentConfigGroup = Array("Wallpaper", "org.kde.image", "General");
+        d.writeConfig("Image", {plasma_image});
+        d.writeConfig("Color", {plasma_color});
+        d.writeConfig("FillMode", "2");
+    }}
+    """
+    # Try qdbus-qt6, qdbus-qt5, or standard qdbus
+    qdbus_bin = shutil.which("qdbus-qt6") or shutil.which("qdbus-qt5") or shutil.which("qdbus")
+    if qdbus_bin:
+        try:
+            subprocess.run(
+                [qdbus_bin, "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", plasma_script],
+                timeout=0.8, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            logger.debug(f"KDE qdbus sync ignored: {e}")
+    elif shutil.which("gdbus"):
+        try:
+            subprocess.run(
+                [
+                    "gdbus", "call", "--session",
+                    "--dest", "org.kde.plasmashell",
+                    "--object-path", "/PlasmaShell",
+                    "--method", "org.kde.PlasmaShell.evaluateScript",
+                    plasma_script
+                ],
+                timeout=0.8, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            logger.debug(f"KDE gdbus sync ignored: {e}")
+
+
+def set_process_name(name="mdeon-desktop"):
+    """Set the process title to this script's filename."""
+    name = Path(__file__).name
+    sys.argv[0] = name
+    try:
+        libc = ctypes.cdll.LoadLibrary("libc.so.6")
+        # PR_SET_NAME = 15 (sets /proc/self/comm)
+        libc.prctl(15, name.encode("utf-8"), 0, 0, 0)
+    except Exception:
+        pass
+    try:
+        import setproctitle
+        setproctitle.setproctitle(name)
+    except ImportError:
+        pass
+
+set_process_name("mdeon-desktop")
+
+
+def acquire_instance_lock():
+    global _instance_lock
+    try:
+        INSTANCE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _instance_lock = open(INSTANCE_LOCK_PATH, "a+")
+        fcntl.flock(_instance_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        logger.warning("Another MDEON desktop instance is already running.")
+        return False
+    except OSError as exc:
+        logger.error(f"Could not acquire desktop instance lock: {exc}")
+        return False
+
+
+def as_bool(v):
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def as_int(v, default, minimum, maximum):
+    try:
+        return max(minimum, min(maximum, int(str(v).strip())))
+    except Exception:
+        return default
+
+
+def hex_to_rgb(hex_str, fallback=(0.18, 0.18, 0.18)):
+    s = str(hex_str).strip().lstrip("#")
+    try:
+        if len(s) == 3:
+            s = "".join(c * 2 for c in s)
+        if len(s) == 6:
+            return (int(s[0:2], 16) / 255.0, int(s[2:4], 16) / 255.0, int(s[4:6], 16) / 255.0)
+    except Exception:
+        pass
+    return fallback
+
+
+def read_mdeon_conf():
+    """
+    Authoritative config reader prioritizing ~/.config/mdeon/mdeon.conf
+    for wallpaper and fallback color settings.
+    """
+    data = dict(DESKTOP_CONFIG_DEFAULTS)
+    # Ordered from system defaults to user overrides:
+    # mdeon.conf is loaded after desktop.conf to maintain strict authority
+    for p in [DESKTOP_DFLT, MDEON_DFLT, DESKTOP_CONF, MDEON_CONF]:
+        if not p or not p.exists():
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    data[k.strip().upper()] = v.strip().strip("'\"")
+        except Exception:
+            pass
+
+    # AccountsService is the fallback only when the authoritative user config is absent.
+    if not MDEON_CONF.exists() and not data.get("WALLPAPER", "").strip():
+        accounts_user = Path("/var/lib/AccountsService/users") / os.environ.get("USER", "")
+        if accounts_user.exists():
+            try:
+                for line in accounts_user.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if line.startswith("BackgroundFile="):
+                        data["WALLPAPER"] = line.split("=", 1)[1].strip().strip("'\"")
+                        break
+            except OSError:
+                pass
+
+    # Ensure FALLBACK_COLOR is properly reflected in background values
+    if "FALLBACK_COLOR" in data and ("MENU_BG_COLOR" not in data or data["MENU_BG_COLOR"] == DESKTOP_CONFIG_DEFAULTS["MENU_BG_COLOR"]):
+        data["MENU_BG_COLOR"] = data["FALLBACK_COLOR"]
+
+    # Synchronize external compositors (GNOME, KWin X11, KWin Wayland)
+    wp = os.path.expanduser(data.get("WALLPAPER", "").strip())
+    col = data.get("FALLBACK_COLOR", data.get("MENU_BG_COLOR", "#2d2d2d"))
+    sync_external_compositor_wallpaper(wp, col)
+    return data
+
+
+def safe_popen(cmd_args, cwd=None):
+    try:
+        subprocess.Popen(
+            cmd_args,
+            cwd=cwd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Direct launch failed for {cmd_args}: {e}")
+        return False
+
+
+# ----------------------------------------------------------------------
+# XDG Standard Icon Theme Specification Engine
+# ----------------------------------------------------------------------
+try:
+    gdk_pixbuf = ctypes.cdll.LoadLibrary("libgdk-pixbuf-2.0.so.0")
+    gdk_pixbuf.gdk_pixbuf_new_from_file_at_scale.restype = ctypes.c_void_p
+    gdk_pixbuf.gdk_pixbuf_new_from_file_at_scale.argtypes = [
+        ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p
+    ]
+    gdk_pixbuf.gdk_pixbuf_get_pixels.restype = ctypes.c_void_p
+    gdk_pixbuf.gdk_pixbuf_get_pixels.argtypes = [ctypes.c_void_p]
+    gdk_pixbuf.gdk_pixbuf_get_rowstride.restype = ctypes.c_int
+    gdk_pixbuf.gdk_pixbuf_get_rowstride.argtypes = [ctypes.c_void_p]
+    gdk_pixbuf.gdk_pixbuf_get_n_channels.restype = ctypes.c_int
+    gdk_pixbuf.gdk_pixbuf_get_n_channels.argtypes = [ctypes.c_void_p]
+    gdk_pixbuf.gdk_pixbuf_get_width.restype = ctypes.c_int
+    gdk_pixbuf.gdk_pixbuf_get_width.argtypes = [ctypes.c_void_p]
+    gdk_pixbuf.gdk_pixbuf_get_height.restype = ctypes.c_int
+    gdk_pixbuf.gdk_pixbuf_get_height.argtypes = [ctypes.c_void_p]
+
+    gobject = ctypes.cdll.LoadLibrary("libgobject-2.0.so.0")
+    gobject.g_object_unref.argtypes = [ctypes.c_void_p]
+    HAVE_GDK_PIXBUF = True
+except Exception:
+    HAVE_GDK_PIXBUF = False
+
+
+class XdgIconTheme:
+    BASE_DIRS = [
+        Path.home() / ".local/share/icons",
+        Path.home() / ".icons",
+        Path("/usr/local/share/icons"),
+        Path("/usr/share/icons"),
+        Path("/usr/share/pixmaps")
+    ]
+    EXTENSIONS = [".png", ".svg", ".xpm", ".svgz"]
+
+    def __init__(self, target_size=48):
+        self.target_size = target_size
+        self.cache = {}
+        self.path_cache = {}
+        self.surface_buffers = {}
+        self.theme_chain = self._detect_theme_chain()
+
+    def _detect_theme_chain(self):
+        primary = None
+        if shutil.which("xfconf-query"):
+            try:
+                res = subprocess.run(
+                    ["xfconf-query", "-c", "xsettings", "-p", "/Net/IconThemeName"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+                )
+                t = res.stdout.strip()
+                if t:
+                    primary = t
+            except Exception:
+                pass
+
+        if not primary:
+            for p in [Path.home() / ".config/lxqt/lxqt.conf", Path.home() / ".config/gtk-3.0/settings.ini", Path.home() / ".gtkrc-2.0"]:
+                if p.exists():
+                    try:
+                        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                            if "icon_theme" in line or "gtk-icon-theme-name" in line:
+                                primary = line.split("=")[1].strip().strip("'\"")
+                                break
+                    except Exception:
+                        pass
+                if primary:
+                    break
+
+        if not primary and shutil.which("gsettings"):
+            try:
+                res = subprocess.run(
+                    ["gsettings", "get", "org.gnome.desktop.interface", "icon-theme"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+                )
+                t = res.stdout.strip().strip("'\"")
+                if t:
+                    primary = t
+            except Exception:
+                pass
+
+        primary = primary or "hicolor"
+        chain = [primary]
+
+        def resolve_inherits(theme_name):
+            for base in self.BASE_DIRS:
+                idx = base / theme_name / "index.theme"
+                if idx.is_file():
+                    try:
+                        cp = configparser.ConfigParser(interpolation=None)
+                        cp.read(idx, encoding="utf-8")
+                        inherits = cp.get("Icon Theme", "Inherits", fallback="")
+                        for inh in inherits.split(","):
+                            inh = inh.strip()
+                            if inh and inh not in chain:
+                                chain.append(inh)
+                                resolve_inherits(inh)
+                    except Exception:
+                        pass
+
+        resolve_inherits(primary)
+        for fb in ["Adwaita", "breeze", "elementary", "oxygen", "hicolor"]:
+            if fb not in chain:
+                chain.append(fb)
+        return chain
+
+    def _find_pwa_icon(self, icon_clean):
+        # 1. Check hicolor size directories
+        for base in self.BASE_DIRS:
+            hicolor = base / "hicolor"
+            if hicolor.is_dir():
+                for sz in [self.target_size, 128, 256, 48, 64, 32, 512, 192, 16]:
+                    for ext in self.EXTENSIONS:
+                        cand = hicolor / f"{sz}x{sz}" / "apps" / f"{icon_clean}{ext}"
+                        if cand.is_file():
+                            return str(cand)
+
+        # 2. Check user icons recursively
+        user_icons = Path.home() / ".local/share/icons"
+        if user_icons.is_dir():
+            for match in user_icons.rglob(f"*{icon_clean}*"):
+                if match.is_file() and match.suffix.lower() in self.EXTENSIONS:
+                    return str(match)
+
+        # 3. Check browser cache directly
+        chrome_conf = Path.home() / ".config/google-chrome"
+        if chrome_conf.is_dir():
+            match_id = re.search(r"chrome-([a-z0-9]+)", icon_clean)
+            app_id = match_id.group(1) if match_id else icon_clean
+            for match in chrome_conf.rglob(f"*{app_id}*"):
+                if match.is_dir():
+                    for icon_file in match.glob("*.png"):
+                        return str(icon_file)
+
+        return None
+
+    def _find_icon_in_theme(self, theme, icon_name):
+        categories = ["apps", "mimetypes", "places", "devices", "status", "actions", "categories"]
+        sizes = [f"{self.target_size}x{self.target_size}", "scalable", "48x48", "64x64", "128x128", "32x32", "24x24", "16x16"]
+
+        for base in self.BASE_DIRS:
+            tdir = base / theme
+            if not tdir.is_dir():
+                continue
+
+            for sz in sizes:
+                for cat in categories:
+                    cat_dir = tdir / sz / cat
+                    if cat_dir.is_dir():
+                        for ext in self.EXTENSIONS:
+                            cand = cat_dir / f"{icon_name}{ext}"
+                            if cand.is_file():
+                                return str(cand)
+
+            for root, _, files in os.walk(tdir, followlinks=False):
+                root_path = Path(root)
+                for ext in self.EXTENSIONS:
+                    cand = root_path / f"{icon_name}{ext}"
+                    if cand.is_file():
+                        return str(cand)
+
+        return None
+
+    def find_icon_path(self, icon_names):
+        if isinstance(icon_names, str):
+            icon_names = [icon_names]
+
+        for raw_name in icon_names:
+            if not raw_name:
+                continue
+
+            if os.path.isabs(str(raw_name)) and os.path.exists(str(raw_name)):
+                return str(raw_name)
+
+            icon_clean = re.sub(r"\.(png|svg|xpm|svgz|ico)$", "", str(raw_name).strip(), flags=re.I)
+            if icon_clean in self.path_cache:
+                return self.path_cache[icon_clean]
+
+            # Targeted PWA resolution
+            if icon_clean.startswith("chrome-") or "crx_" in icon_clean:
+                pwa = self._find_pwa_icon(icon_clean)
+                if pwa:
+                    self.path_cache[icon_clean] = pwa
+                    return pwa
+
+            # Standard theme search
+            for theme in self.theme_chain:
+                found = self._find_icon_in_theme(theme, icon_clean)
+                if found:
+                    self.path_cache[icon_clean] = found
+                    return found
+
+            # Pixmaps
+            pix = Path("/usr/share/pixmaps")
+            for ext in self.EXTENSIONS:
+                cand = pix / f"{icon_clean}{ext}"
+                if cand.is_file():
+                    res = str(cand)
+                    self.path_cache[icon_clean] = res
+                    return res
+
+            # Fallback
+            user_icons = Path.home() / ".local/share/icons"
+            if user_icons.is_dir():
+                for match in user_icons.rglob(f"{icon_clean}.*"):
+                    if match.suffix.lower() in self.EXTENSIONS:
+                        res = str(match)
+                        self.path_cache[icon_clean] = res
+                        return res
+
+        return None
+
+    def load_surface_from_file(self, icon_path):
+        if not icon_path or not os.path.exists(icon_path):
+            return None
+
+        # 1. Native librsvg vector rendering
+        if icon_path.endswith((".svg", ".svgz")) and HAVE_RSVG:
+            try:
+                handle = Rsvg.Handle.new_from_file(icon_path)
+                surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.target_size, self.target_size)
+                cr = cairo.Context(surf)
+                rect = Rsvg.Rectangle()
+                rect.x, rect.y, rect.width, rect.height = 0, 0, float(self.target_size), float(self.target_size)
+                if hasattr(handle, "render_document"):
+                    handle.render_document(cr, rect)
+                else:
+                    dim = handle.get_dimensions()
+                    if dim.width > 0 and dim.height > 0:
+                        cr.scale(self.target_size / dim.width, self.target_size / dim.height)
+                    handle.render_cairo(cr)
+                return surf
+            except Exception as e:
+                logger.debug(f"RSVG render error: {e}")
+
+        # 2. Native Cairo PNG loader (Cleanest, eliminates halo and buffer corruption)
+        if icon_path.endswith(".png"):
+            try:
+                orig = cairo.ImageSurface.create_from_png(icon_path)
+                w, h = orig.get_width(), orig.get_height()
+                if w == self.target_size and h == self.target_size:
+                    return orig
+                elif w > 0 and h > 0:
+                    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.target_size, self.target_size)
+                    cr = cairo.Context(surf)
+                    cr.scale(self.target_size / w, self.target_size / h)
+                    cr.set_source_surface(orig, 0, 0)
+                    cr.paint()
+                    return surf
+            except Exception as e:
+                logger.debug(f"Cairo PNG load error: {e}")
+
+        # 3. GdkPixbuf loader
+        if HAVE_GDK_PIXBUF:
+            try:
+                pb = gdk_pixbuf.gdk_pixbuf_new_from_file_at_scale(
+                    icon_path.encode("utf-8"), self.target_size, self.target_size, 1, None
+                )
+                if pb:
+                    w = gdk_pixbuf.gdk_pixbuf_get_width(pb)
+                    h = gdk_pixbuf.gdk_pixbuf_get_height(pb)
+                    stride = gdk_pixbuf.gdk_pixbuf_get_rowstride(pb)
+                    n_ch = gdk_pixbuf.gdk_pixbuf_get_n_channels(pb)
+                    pixels_ptr = gdk_pixbuf.gdk_pixbuf_get_pixels(pb)
+                    raw_bytes = ctypes.string_at(pixels_ptr, stride * h)
+
+                    cairo_raw = bytearray(w * h * 4)
+                    for row in range(h):
+                        srow = row * stride
+                        trow = row * w * 4
+                        for col in range(w):
+                            sp = srow + col * n_ch
+                            tp = trow + col * 4
+                            r = raw_bytes[sp]
+                            g = raw_bytes[sp + 1]
+                            b = raw_bytes[sp + 2]
+                            a = raw_bytes[sp + 3] if n_ch == 4 else 255
+                            cairo_raw[tp] = (b * a + 127) // 255
+                            cairo_raw[tp + 1] = (g * a + 127) // 255
+                            cairo_raw[tp + 2] = (r * a + 127) // 255
+                            cairo_raw[tp + 3] = a
+
+                    surf = cairo.ImageSurface.create_for_data(
+                        cairo_raw, cairo.FORMAT_ARGB32, w, h, w * 4
+                    )
+                    self.surface_buffers[icon_path] = cairo_raw
+                    gobject.g_object_unref(pb)
+                    return surf
+            except Exception as e:
+                logger.debug(f"GdkPixbuf load error: {e}")
+
+        # 4. Pillow Fallback
+        if HAVE_PIL:
+            try:
+                im = Image.open(icon_path).convert("RGBA")
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                buf.seek(0)
+                orig = cairo.ImageSurface.create_from_png(buf)
+                w, h = orig.get_width(), orig.get_height()
+                if w == self.target_size and h == self.target_size:
+                    return orig
+                elif w > 0 and h > 0:
+                    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.target_size, self.target_size)
+                    cr = cairo.Context(surf)
+                    cr.scale(self.target_size / w, self.target_size / h)
+                    cr.set_source_surface(orig, 0, 0)
+                    cr.paint()
+                    return surf
+            except Exception as e:
+                logger.debug(f"Pillow load error: {e}")
+
+        return None
+
+    def get_cairo_surface(self, icon_names, is_dir=False):
+        cache_key = tuple(icon_names) if isinstance(icon_names, list) else (icon_names,)
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        icon_path = self.find_icon_path(icon_names)
+        surf = self.load_surface_from_file(icon_path) if icon_path else None
+
+        self.cache[cache_key] = surf
+        return surf
+
+
+# ----------------------------------------------------------------------
+# Core Desktop Controller
+# ----------------------------------------------------------------------
+class MdeonCoreDesktop:
+    def __init__(self, width, height, flush_cb):
+        self.width = width
+        self.height = height
+        self.flush_cb = flush_cb
+
+        self.desktop_dir = Path(os.path.expanduser("~/Desktop"))
+        self.desktop_dir.mkdir(parents=True, exist_ok=True)
+
+        self.config = read_mdeon_conf()
+        self.wallpaper_path = os.path.expanduser(self.config.get("WALLPAPER", "").strip())
+        self.layout_config = load_desktop_layout()
+        self.monitors = []
+        self.monitor_wallpapers = {}
+        self.active_default_monitor = None
+        self.default_monitor_missing = False
+        self.last_topology_check = 0
+        self.monitor_signature = ()
+        bg_hex = self.config.get("FALLBACK_COLOR", self.config.get("MENU_BG_COLOR", "#2d2d2d"))
+        self.bg_color = hex_to_rgb(bg_hex)
+
+        self.icon_size = as_int(self.config.get("ICON_SIZE_PIXELS", 48), 48, 24, 128)
+        self.font_size = as_int(self.config.get("ICON_FONT_SIZE_PIXELS", 15), 15, 6, 72)
+        self.icon_font_color = hex_to_rgb(
+            self.config.get("ICON_FONT_COLOR", "#ffffff"), fallback=(1.0, 1.0, 1.0)
+        )
+        self.label_chars = as_int(self.config.get("ICON_LABEL_WIDTH_CHARS", 10), 10, 4, 48)
+        self.label_max_lines = as_int(self.config.get("ICON_LABEL_MAX_LINES", 2), 2, 1, 6)
+
+        approx_char_width = max(6, round(self.font_size * 0.55))
+        label_width = self.label_chars * approx_char_width + 16
+        self.cell_w = max(76, self.icon_size + 16, label_width)
+        self.cell_h = self.icon_size + (self.font_size + 4) * self.label_max_lines + 14
+
+        self.items = []
+        self.selected_idx = -1
+        self.selected_indices = set()
+        self.last_click_time = 0
+        self.drag_candidate = None
+        self.dragging = False
+        self.drag_start = (0, 0)
+        self.drag_item_origins = {}
+        self.rubberbanding = False
+        self.rubberband_start = (0, 0)
+        self.rubberband_rect = (0, 0, 0, 0)
+
+        # Context Menu & Submenu State
+        self.menu_visible = False
+        self.menu_x = 0
+        self.menu_y = 0
+        self.menu_w = 240
+        self.menu_h = 0
+        self.menu_items = []
+        self.hovered_menu_idx = -1
+
+        self.submenu_visible = False
+        self.submenu_x = 0
+        self.submenu_y = 0
+        self.submenu_w = 260
+        self.submenu_h = 0
+        self.submenu_items = []
+        self.hovered_submenu_idx = -1
+
+        # Interactive Modal State
+        self.modal_active = False
+        self.modal_title = ""
+        self.modal_desc = ""
+        self.modal_buttons = []
+        self.modal_w = 460
+        self.modal_h = 240
+
+        self.last_key_search_time = 0
+        self.key_search_buffer = ""
+        self.last_dir_mtime = 0
+        self.last_trash_count = -1
+
+        self.icon_theme = XdgIconTheme(target_size=self.icon_size)
+        self._init_cairo()
+        self.reload_wallpaper()
+        self.refresh_items()
+        self.update_monitor_topology()
+
+    def _init_cairo(self):
+        self.surface = cairo.ImageSurface(cairo.FORMAT_RGB24, self.width, self.height)
+        self.ctx = ThemedContext(cairo.Context(self.surface), prefers_light_scheme())
+        self.stride = self.surface.get_stride()
+        self.data_buffer = self.surface.get_data()
+
+    def reload_wallpaper(self):
+        self.wallpaper_surface = None
+        if HAVE_PIL and self.wallpaper_path and os.path.exists(self.wallpaper_path):
+            try:
+                im = Image.open(self.wallpaper_path).convert("RGBA")
+                im = im.resize((self.width, self.height), Image.Resampling.BILINEAR)
+                w, h = im.size
+                rgba = im.tobytes()
+                raw = bytearray(w * h * 4)
+                for idx in range(w * h):
+                    sp = idx * 4
+                    r, g, b, a = rgba[sp], rgba[sp+1], rgba[sp+2], rgba[sp+3]
+                    raw[sp] = (b * a + 127) // 255
+                    raw[sp+1] = (g * a + 127) // 255
+                    raw[sp+2] = (r * a + 127) // 255
+                    raw[sp+3] = a
+                self.wallpaper_surface = cairo.ImageSurface.create_for_data(
+                    raw, cairo.FORMAT_ARGB32, w, h, w * 4
+                )
+            except Exception as e:
+                logger.error(f"Wallpaper load error: {e}")
+
+    def update_monitor_topology(self, monitors=None):
+        monitors = get_active_monitors() if monitors is None else monitors
+        if not monitors:
+            monitors = [{
+                "name": "default",
+                "x": 0,
+                "y": 0,
+                "width": self.width,
+                "height": self.height,
+                "scale": 1.0,
+                "primary": True,
+            }]
+
+        self.monitors = monitors
+        self.monitor_signature = tuple(
+            (
+                monitor["name"], monitor["x"], monitor["y"],
+                monitor["width"], monitor["height"], monitor["scale"],
+                monitor["primary"],
+            )
+            for monitor in monitors
+        )
+        names = {monitor["name"] for monitor in monitors}
+        if len(monitors) == 1:
+            self.active_default_monitor = monitors[0]["name"]
+            self.default_monitor_missing = False
+        else:
+            saved_default = self.layout_config.get("default_monitor")
+            if saved_default is None:
+                primary = next((monitor for monitor in monitors if monitor["primary"]), monitors[0])
+                self.active_default_monitor = primary["name"]
+                self.layout_config["default_monitor"] = primary["name"]
+                self.default_monitor_missing = False
+                try:
+                    save_desktop_layout(self.layout_config)
+                except OSError as exc:
+                    logger.warning("Could not save default monitor: %s", exc)
+            else:
+                self.default_monitor_missing = saved_default not in names
+                self.active_default_monitor = saved_default if saved_default in names else None
+
+        if (
+            not self.default_monitor_missing
+            and self.modal_title == "Default monitor is unavailable"
+        ):
+            self.modal_active = False
+            self.modal_buttons = []
+
+        self.monitor_wallpapers = {}
+        wallpaper_overrides = self.layout_config.get("wallpapers", {})
+        for monitor in monitors:
+            if len(monitors) == 1:
+                wallpaper_path = self.wallpaper_path
+            else:
+                wallpaper_path = wallpaper_overrides.get(monitor["name"], self.wallpaper_path)
+            self.monitor_wallpapers[monitor["name"]] = self._load_wallpaper_surface(
+                wallpaper_path,
+                monitor["width"],
+                monitor["height"],
+            )
+        self.layout_icons()
+        if self.default_monitor_missing:
+            self.show_default_monitor_recovery()
+
+    def show_default_monitor_recovery(self):
+        self.modal_active = True
+        self.modal_title = "Default monitor is unavailable"
+        self.modal_desc = "Choose a connected monitor as the new default."
+        self.modal_w = min(460, self.width - 20)
+        self.modal_h = 90 + len(self.monitors) * 34
+        left = (self.width - self.modal_w) // 2
+        top = (self.height - self.modal_h) // 2
+        self.modal_buttons = []
+        for index, monitor in enumerate(self.monitors):
+            name = monitor["name"]
+            self.modal_buttons.append((
+                left + 24,
+                top + 64 + index * 34,
+                self.modal_w - 48,
+                28,
+                f"Use {name}",
+                lambda selected=name: self.set_default_monitor(selected),
+            ))
+
+    def set_default_monitor(self, name):
+        if name not in {monitor["name"] for monitor in self.monitors}:
+            return
+        self.layout_config["default_monitor"] = name
+        self.active_default_monitor = name
+        self.default_monitor_missing = False
+        self.modal_active = False
+        try:
+            save_desktop_layout(self.layout_config)
+        except OSError as exc:
+            logger.warning("Could not save default monitor: %s", exc)
+        self.layout_icons()
+        self.redraw()
+
+    def get_monitor_at(self, x, y):
+        for monitor in self.monitors:
+            if (
+                monitor["x"] <= x < monitor["x"] + monitor["width"]
+                and monitor["y"] <= y < monitor["y"] + monitor["height"]
+            ):
+                return monitor
+        return self.monitors[0] if self.monitors else None
+
+    def set_monitor_wallpaper(self, monitor_name):
+        if len(self.monitors) < 2 or monitor_name not in {m["name"] for m in self.monitors}:
+            return
+        wallpaper_path = self.layout_config.get("wallpapers", {}).get(monitor_name)
+        wallpaper = self.choose_wallpaper(
+            "Select Monitor Wallpaper",
+            wallpaper_path or self.wallpaper_path,
+        )
+        if not wallpaper:
+            return
+        self.layout_config.setdefault("wallpapers", {})[monitor_name] = wallpaper
+        try:
+            save_desktop_layout(self.layout_config)
+            self.update_monitor_topology()
+            self.redraw()
+        except OSError as exc:
+            logger.warning("Could not set monitor wallpaper: %s", exc)
+
+    def choose_wallpaper(self, title, initial_path=None):
+        initial_dir = Path(initial_path).expanduser().parent if initial_path else Path.home()
+        if not initial_dir.is_dir():
+            initial_dir = Path.home()
+        if shutil.which("zenity"):
+            command = [
+                "zenity", "--file-selection", f"--title={title}",
+                f"--filename={initial_dir}{os.sep}",
+                "--file-filter=Images | *.png *.jpg *.jpeg *.webp *.bmp",
+            ]
+        elif shutil.which("kdialog"):
+            command = ["kdialog", "--getopenfilename", str(initial_dir), "Images (*.png *.jpg *.jpeg *.webp *.bmp)"]
+        else:
+            return None
+        try:
+            with subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ) as process:
+                deadline = time.monotonic() + 300
+                while True:
+                    try:
+                        output, _ = process.communicate(
+                            timeout=min(0.5, max(0, deadline - time.monotonic()))
+                        )
+                        break
+                    except subprocess.TimeoutExpired:
+                        update_watchdog_heartbeat()
+                        if time.monotonic() >= deadline:
+                            process.kill()
+                            process.communicate()
+                            raise subprocess.TimeoutExpired(command, 300)
+                wallpaper = output.strip()
+            if process.returncode != 0 or not wallpaper or not os.path.isfile(wallpaper):
+                return None
+            return wallpaper
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("Could not choose wallpaper: %s", exc)
+            return None
+
+    def set_default_wallpaper(self):
+        wallpaper = self.choose_wallpaper(
+            "Select Default Wallpaper",
+            self.wallpaper_path,
+        )
+        if not wallpaper:
+            return
+
+        try:
+            source = MDEON_CONF if MDEON_CONF.exists() else MDEON_DFLT
+            lines = source.read_text(encoding="utf-8").splitlines() if source.exists() else []
+            escaped = wallpaper.replace("\\", "\\\\").replace('"', '\\"')
+            replacement = f'WALLPAPER="{escaped}"'
+            found = False
+            for index, line in enumerate(lines):
+                if line.strip().split("=", 1)[0].strip().upper() == "WALLPAPER":
+                    lines[index] = replacement
+                    found = True
+                    break
+            if not found:
+                lines.append(replacement)
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            backup_config_file(MDEON_CONF)
+            temp_path = MDEON_CONF.with_name(f".mdeon.conf-{os.getpid()}.tmp")
+            temp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            os.replace(temp_path, MDEON_CONF)
+            self.config["WALLPAPER"] = wallpaper
+            self.wallpaper_path = wallpaper
+            read_mdeon_conf()
+            self.update_monitor_topology()
+            self.redraw()
+        except OSError as exc:
+            logger.warning("Could not save default wallpaper: %s", exc)
+
+    def _load_wallpaper_surface(self, wallpaper_path, width, height):
+        if not HAVE_PIL or not wallpaper_path or not os.path.isfile(wallpaper_path):
+            return None
+        try:
+            image = Image.open(wallpaper_path).convert("RGBA")
+            scale = max(width / image.width, height / image.height)
+            scaled_size = (max(width, round(image.width * scale)), max(height, round(image.height * scale)))
+            image = image.resize(scaled_size, Image.Resampling.BILINEAR)
+            left = (image.width - width) // 2
+            top = (image.height - height) // 2
+            image = image.crop((left, top, left + width, top + height))
+            rgba = image.tobytes()
+            raw = bytearray(width * height * 4)
+            for idx in range(width * height):
+                source = idx * 4
+                raw[source] = (rgba[source + 2] * rgba[source + 3] + 127) // 255
+                raw[source + 1] = (rgba[source + 1] * rgba[source + 3] + 127) // 255
+                raw[source + 2] = (rgba[source] * rgba[source + 3] + 127) // 255
+                raw[source + 3] = rgba[source + 3]
+            return cairo.ImageSurface.create_for_data(
+                raw, cairo.FORMAT_ARGB32, width, height, width * 4
+            )
+        except Exception as exc:
+            logger.warning("Could not load monitor wallpaper %s: %s", wallpaper_path, exc)
+            return None
+
+    def layout_icons(self):
+        if not self.monitors:
+            return
+        monitor_by_name = {monitor["name"]: monitor for monitor in self.monitors}
+        occupied = {name: set() for name in monitor_by_name}
+        next_slots = {name: 0 for name in monitor_by_name}
+        assignments = self.layout_config.get("icon_assignments", {})
+
+        for item in self.items:
+            saved = assignments.get(item["layout_id"], {})
+            if len(self.monitors) == 1:
+                monitor_name = self.monitors[0]["name"]
+            else:
+                preferred = saved.get("monitor")
+                monitor_name = preferred if preferred in monitor_by_name else (
+                    self.active_default_monitor or self.monitors[0]["name"]
+                )
+
+            monitor = monitor_by_name[monitor_name]
+            try:
+                col = max(0, int(saved["col"]))
+                row = max(0, int(saved["row"]))
+                if saved.get("monitor") != monitor_name:
+                    raise ValueError
+            except (KeyError, TypeError, ValueError):
+                rows_per_col = max(1, (monitor["height"] - 40) // self.cell_h)
+                slot = next_slots[monitor_name]
+                col, row = divmod(slot, rows_per_col)
+                while (col, row) in occupied[monitor_name]:
+                    slot += 1
+                    col, row = divmod(slot, rows_per_col)
+                next_slots[monitor_name] = slot + 1
+
+            occupied[monitor_name].add((col, row))
+            item["effective_monitor"] = monitor_name
+            item["col"] = col
+            item["row"] = row
+            item["x"] = monitor["x"] + 20 + col * self.cell_w
+            item["y"] = monitor["y"] + 20 + row * self.cell_h
+
+    def _split_text_to_lines(self, text):
+        clean_text = " ".join(str(text).split())
+        if self.label_max_lines <= 1:
+            if len(clean_text) > self.label_chars:
+                return [clean_text[:max(1, self.label_chars - 3)] + "..."]
+            return [clean_text]
+
+        words = clean_text.split()
+        lines = []
+        current = ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            if len(candidate) <= self.label_chars:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+            if len(lines) >= self.label_max_lines - 1:
+                break
+
+        if current and len(lines) < self.label_max_lines:
+            lines.append(current)
+
+        if not lines:
+            lines = [clean_text[:max(1, self.label_chars - 3)] + "..."]
+        elif " ".join(lines) != clean_text:
+            lines[-1] = lines[-1][:max(1, self.label_chars - 3)] + "..."
+        return lines[:self.label_max_lines]
+
+    def _get_exact_icon_and_name(self, file_path):
+        filename = file_path.name
+
+        # 1. Desktop Entry inspection (GioUnix / KeyFile)
+        if filename.endswith(".desktop"):
+            if HAVE_GIO:
+                try:
+                    app_info = DesktopAppInfo.new_from_filename(str(file_path))
+                    if app_info:
+                        disp_name = app_info.get_name() or filename
+                        gicon = app_info.get_icon()
+                        if gicon:
+                            if hasattr(gicon, "get_names"):
+                                return list(gicon.get_names()), disp_name
+                            elif hasattr(gicon, "get_file"):
+                                return [gicon.get_file().get_path()], disp_name
+                except Exception:
+                    pass
+
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="ignore")
+                idx = content.find("[Desktop Entry]")
+                if idx != -1:
+                    content = content[idx:]
+                cp = configparser.ConfigParser(interpolation=None)
+                cp.read_string(content)
+                disp_name = cp.get("Desktop Entry", "Name", fallback=filename)
+                icon_val = cp.get("Desktop Entry", "Icon", fallback=None)
+                if icon_val:
+                    return [icon_val, "application-x-desktop"], disp_name
+            except Exception:
+                pass
+            return ["application-x-desktop"], filename
+
+        if file_path.is_dir():
+            return ["folder", "inode-directory"], filename
+
+        # 2. GIO MIME Query
+        if HAVE_GIO:
+            try:
+                gfile = Gio.File.new_for_path(str(file_path))
+                info = gfile.query_info(
+                    "standard::icon,standard::content-type",
+                    Gio.FileQueryInfoFlags.NONE,
+                    None
+                )
+                gicon = info.get_icon()
+                if gicon and hasattr(gicon, "get_names"):
+                    names = [n for n in gicon.get_names() if not n.endswith("-symbolic")]
+                    if names:
+                        return names, filename
+            except Exception:
+                pass
+
+        # 3. Fallback table
+        suffix = file_path.suffix.lower()
+        if suffix in FALLBACK_MIME_ICONS:
+            return FALLBACK_MIME_ICONS[suffix], filename
+
+        if os.access(str(file_path), os.X_OK):
+            return ["application-x-executable", "text-x-generic"], filename
+
+        return ["text-x-generic"], filename
+
+    def check_auto_refresh(self):
+        now = time.monotonic()
+        if now - self.last_topology_check >= 2.0:
+            self.last_topology_check = now
+            monitors = get_active_monitors()
+            if monitors:
+                signature = tuple(
+                    (
+                        monitor["name"], monitor["x"], monitor["y"],
+                        monitor["width"], monitor["height"], monitor["scale"],
+                        monitor["primary"],
+                    )
+                    for monitor in monitors
+                )
+                if signature != self.monitor_signature:
+                    self.update_monitor_topology(monitors)
+                    self.redraw()
+        try:
+            mtime = self.desktop_dir.stat().st_mtime
+            trash_count = len(list(TRASH_FILES_DIR.iterdir())) if TRASH_FILES_DIR.exists() else 0
+            if mtime != self.last_dir_mtime or trash_count != self.last_trash_count:
+                self.last_dir_mtime = mtime
+                self.last_trash_count = trash_count
+                self.refresh_items()
+                self.redraw()
+        except Exception:
+            pass
+
+    def refresh_items(self):
+        self.items = []
+        has_trash = TRASH_FILES_DIR.exists() and any(TRASH_FILES_DIR.iterdir())
+        v_map = {
+            "HOME": ["user-home"],
+            "COMPUTER": ["computer", "system-file-manager"],
+            "NETWORK": ["network-workgroup", "network-server"],
+            "TRASH": ["user-trash-full", "user-trash"] if has_trash else ["user-trash"],
+            "BROWSER": ["web-browser", "firefox", "chromium"]
+        }
+
+        # 1. Virtual icons
+        for key, label, icon_name, vpath in VIRTUAL_ICONS:
+            if as_bool(self.config.get(key, "false")):
+                self.items.append({
+                    "layout_id": f"virtual:{key}",
+                    "name": label,
+                    "path": vpath,
+                    "is_dir": False,
+                    "is_virtual": True,
+                    "vkey": key,
+                    "icon_name": v_map.get(key, [icon_name, "application-x-generic"])
+                })
+
+        # 2. Files on desktop
+        try:
+            for entry in sorted(os.listdir(self.desktop_dir)):
+                if entry.startswith(".") or entry.endswith("~"):
+                    continue
+                p = self.desktop_dir / entry
+                icon_names, display_name = self._get_exact_icon_and_name(p)
+
+                self.items.append({
+                    "layout_id": str(p),
+                    "name": display_name,
+                    "path": str(p),
+                    "is_dir": p.is_dir(),
+                    "is_virtual": False,
+                    "vkey": None,
+                    "icon_name": icon_names
+                })
+        except Exception as e:
+            logger.error(f"Desktop scan error: {e}")
+        self.selected_idx = -1
+        self.selected_indices.clear()
+        self.layout_icons()
+
+    # ------------------------------------------------------------------
+    # Modular Launchers & System Fallbacks
+    # ------------------------------------------------------------------
+    def spawn_preferred_fm(self, path=None):
+        target = str(path or self.desktop_dir)
+        for fm in FILE_MANAGERS:
+            if shutil.which(fm):
+                safe_popen([fm, target])
+                return
+        safe_popen(["xdg-open", target])
+
+    def spawn_terminal(self, cwd=None):
+        work = str(cwd or self.desktop_dir)
+        for term in [self.config.get("FALLBACK_TERM", "")] + TERMINALS:
+            if term and shutil.which(term):
+                safe_popen([term], cwd=work)
+                return
+
+    def spawn_terminal_command(self, command, cwd=None):
+        work = str(cwd or self.desktop_dir)
+        for term in [self.config.get("FALLBACK_TERM", "")] + TERMINALS:
+            try:
+                terminal_args = shlex.split(term)
+            except ValueError:
+                continue
+            if not terminal_args or not shutil.which(terminal_args[0]):
+                continue
+            terminal_name = Path(terminal_args[0]).name
+            separator = ["--"] if terminal_name == "gnome-terminal" else ["-e"]
+            if safe_popen(
+                [*terminal_args, *separator, *command],
+                cwd=work,
+            ):
+                return True
+        return False
+
+    def spawn_display_settings(self):
+        session_names = " ".join((
+            os.environ.get("XDG_CURRENT_DESKTOP", ""),
+            os.environ.get("XDG_SESSION_DESKTOP", ""),
+            os.environ.get("DESKTOP_SESSION", ""),
+            os.environ.get("MDEON_SESSION_COMPOSITOR", ""),
+        )).casefold()
+        if any(marker in session_names for marker in ("gnome", "mutter")):
+            tools = ["gnome-control-center", "/usr/bin/mdeon-display-settings"]
+        elif any(marker in session_names for marker in ("kde", "plasma", "kwin")):
+            tools = ["systemsettings", "/usr/bin/mdeon-display-settings"]
+        elif SESSION_TYPE == "wayland":
+            tools = ["/usr/bin/mdeon-display-settings", "wdisplays", "nwg-displays"]
+        else:
+            tools = ["/usr/bin/mdeon-display-settings", "arandr", "lxrandr", "xfce4-display-settings"]
+        for tool in tools:
+            if shutil.which(tool):
+                if tool == "gnome-control-center":
+                    command = [tool, "display"]
+                elif tool == "systemsettings":
+                    command = [tool, "kcm_kscreen"]
+                else:
+                    command = [tool]
+                safe_popen(command)
+                return
+
+    def open_virtual_item(self, vpath):
+        if vpath == "virtual://home":
+            self.spawn_preferred_fm(Path.home())
+        elif vpath == "virtual://trash":
+            safe_popen(["xdg-open", "trash:///"])
+        elif vpath == "virtual://browser":
+            desktop_id = ""
+            for browser_query in (
+                ["xdg-mime", "query", "default", "x-scheme-handler/http"],
+                ["xdg-settings", "get", "default-web-browser"],
+            ):
+                if not shutil.which(browser_query[0]):
+                    continue
+                try:
+                    result = subprocess.run(
+                        browser_query,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                        check=False,
+                        timeout=1.0,
+                    )
+                    desktop_id = result.stdout.strip()
+                    if desktop_id:
+                        break
+                except (OSError, subprocess.SubprocessError):
+                    pass
+
+            desktop_file = None
+            if desktop_id:
+                desktop_file_name = Path(desktop_id).name
+                for applications_dir in (
+                    Path.home() / ".local/share/applications",
+                    Path("/usr/local/share/applications"),
+                    Path("/usr/share/applications"),
+                ):
+                    candidate = applications_dir / desktop_file_name
+                    if candidate.is_file():
+                        desktop_file = candidate
+                        break
+
+            if desktop_file and shutil.which("gio"):
+                if safe_popen(["gio", "launch", str(desktop_file)], cwd=Path.home()):
+                    return
+
+            if desktop_file:
+                try:
+                    desktop_entry = configparser.ConfigParser(interpolation=None)
+                    desktop_entry.read(desktop_file, encoding="utf-8")
+                    exec_line = desktop_entry.get("Desktop Entry", "Exec", fallback="")
+                    browser_command = [
+                        token for token in shlex.split(exec_line)
+                        if not token.startswith("%")
+                    ]
+                    browser_command = [
+                        token.replace("%U", "").replace("%u", "").replace("%F", "").replace("%f", "")
+                        for token in browser_command
+                    ]
+                    browser_command = [token for token in browser_command if token]
+                    if browser_command and safe_popen(browser_command, cwd=Path.home()):
+                        return
+                except (OSError, ValueError, configparser.Error):
+                    pass
+
+            logger.warning("Could not resolve the default web browser desktop entry")
+        else:
+            safe_popen(["xdg-open", vpath.replace("virtual://", "") + ":///"])
+
+    def launch_item(self, item):
+        try:
+            if item["is_virtual"]:
+                self.open_virtual_item(item["path"])
+                return
+
+            p = Path(item["path"])
+
+            if p.suffix == ".desktop":
+                if shutil.which("gio") and safe_popen(["gio", "launch", str(p)]):
+                    return
+
+                try:
+                    content = p.read_text(encoding="utf-8", errors="ignore")
+                    idx = content.find("[Desktop Entry]")
+                    if idx != -1:
+                        content = content[idx:]
+                    cp = configparser.ConfigParser(interpolation=None)
+                    cp.read_string(content)
+                    exec_cmd = cp.get("Desktop Entry", "Exec", fallback="")
+                    terminal = cp.getboolean("Desktop Entry", "Terminal", fallback=False)
+
+                    if exec_cmd:
+                        clean_cmd = [
+                            cleaned
+                            for token in shlex.split(exec_cmd)
+                            if (cleaned := re.sub(r"%[a-zA-Z]", "", token.replace("%%", "%")))
+                        ]
+                        if terminal:
+                            self.spawn_terminal_command(clean_cmd, cwd=Path.home())
+                        else:
+                            safe_popen(clean_cmd, cwd=str(Path.home()))
+                        return
+                except Exception:
+                    pass
+
+                self.spawn_preferred_fm(p.parent)
+                return
+
+            if p.is_file() and os.access(str(p), os.X_OK):
+                if safe_popen([str(p)], cwd=str(p.parent)):
+                    return
+
+            if not safe_popen(["xdg-open", str(p)]):
+                self.spawn_preferred_fm(p.parent)
+        except Exception as e:
+            logger.error(f"Failed to launch item: {e}")
+
+    # ------------------------------------------------------------------
+    # GTK4-Style "Open With..." Dynamic Query Pipeline
+    # ------------------------------------------------------------------
+    def get_applications_for_path(self, file_path):
+        """Replicates mdeon-desktop.py Gio.AppInfo association query."""
+        p = Path(file_path)
+        apps = []
+        seen = set()
+
+        if HAVE_GIO:
+            try:
+                content_type, _ = Gio.content_type_guess(str(p), None)
+                default_app = Gio.AppInfo.get_default_for_type(content_type, False)
+                if default_app:
+                    id_name = default_app.get_id()
+                    if id_name and id_name not in seen:
+                        seen.add(id_name)
+                        apps.append(default_app)
+
+                all_apps = Gio.AppInfo.get_all_for_type(content_type)
+                for app in all_apps:
+                    id_name = app.get_id()
+                    if id_name and id_name not in seen:
+                        seen.add(id_name)
+                        apps.append(app)
+            except Exception:
+                pass
+
+        return apps
+
+    def prompt_choose_another_application(self, file_path):
+        p = Path(file_path)
+        if shutil.which("zenity"):
+            res = subprocess.run(
+                ["zenity", "--entry", f"--title=Open With", f"--text=Enter command to execute for '{p.name}':"],
+                stdout=subprocess.PIPE, text=True
+            )
+            cmd = res.stdout.strip()
+            if cmd:
+                safe_popen([cmd, str(p)])
+                return
+
+        self.modal_active = True
+        self.modal_w, self.modal_h = 420, 200
+        self.modal_title = "Choose Another Application"
+        self.modal_desc = f"Run custom command on:\n{p.name}"
+        mx = (self.width - self.modal_w) // 2
+        my = (self.height - self.modal_h) // 2
+
+        self.modal_buttons = [
+            (mx + 30, my + 90, 360, 26, "Run in Text Editor (mousepad)", lambda: [setattr(self, "modal_active", False), safe_popen(["mousepad", str(p)]), self.redraw()]),
+            (mx + 30, my + 125, 360, 26, "Run in Terminal (xterm)", lambda: [setattr(self, "modal_active", False), safe_popen(["xterm", "-e", f"less '{p}'"]), self.redraw()]),
+            (mx + self.modal_w - 110, my + self.modal_h - 40, 85, 26, "Cancel", lambda: [setattr(self, "modal_active", False), self.redraw()])
+        ]
+        self.redraw()
+
+    # ------------------------------------------------------------------
+    # Context Menus & Hierarchical Flyout Submenus
+    # ------------------------------------------------------------------
+    def show_context_menu(self, x, y, is_desktop=True):
+        item_h = 28
+        self.submenu_visible = False
+
+        if is_desktop:
+            self.menu_items = [
+                ("Open Terminal Here", None, lambda: self.spawn_terminal(self.desktop_dir), False),
+                ("Open File Manager Here", None, lambda: self.spawn_preferred_fm(self.desktop_dir), False),
+                ("---", None, None, False),
+                ("Create New File", None, self._action_create_file, False),
+                ("Create New Folder", None, self._action_create_folder, False),
+                ("---", None, None, False),
+                ("Recycling Bin", None, lambda: safe_popen(["xdg-open", "trash:///"]), False),
+                ("Refresh Desktop", "F5", self._action_refresh, False),
+                ("---", None, None, False),
+                ("Display Settings", None, self.spawn_display_settings, False),
+                ("Desktop Icons Configuration...", None, self.show_icons_dialog, False),
+                ("---", None, None, False),
+                ("MDEon Settings", None, lambda: safe_popen(["mdeon-settings"]), False)
+            ]
+            monitor = self.get_monitor_at(x, y)
+            if monitor and len(self.monitors) == 1:
+                self.menu_items.insert(
+                    9,
+                    ("Set Default Wallpaper...", None, self.set_default_wallpaper, False),
+                )
+            elif monitor:
+                monitor_name = monitor["name"]
+                if monitor_name == self.active_default_monitor:
+                    default_action = (f"Default Monitor: {monitor_name}", None, None, False)
+                else:
+                    default_action = (
+                        "Set as Default Monitor",
+                        None,
+                        lambda name=monitor_name: self.set_default_monitor(name),
+                        False,
+                    )
+                self.menu_items[9:9] = [
+                    ("---", None, None, False),
+                    default_action,
+                    (
+                        "Set Wallpaper for this Monitor...",
+                        None,
+                        lambda name=monitor_name: self.set_monitor_wallpaper(name),
+                        False,
+                    ),
+                ]
+        else:
+            it = self.items[self.selected_idx]
+            p = Path(it["path"])
+
+            self.menu_items = [
+                ("Open", "Enter", lambda: self.launch_item(it), False),
+                ("Open With", "▶", None, True),
+                ("Open Containing Folder", None, lambda: self.spawn_preferred_fm(p.parent if not it["is_virtual"] else Path.home()), False),
+            ]
+            if not it["is_virtual"]:
+                self.menu_items.extend([
+                    ("---", None, None, False),
+                    ("Rename...", "F2", lambda: self._prompt_rename(it["path"]), False),
+                    ("Send to Recycling Bin", "Del", lambda: self._action_trash(it["path"]), False),
+                    ("Delete Permanently", "Shift+Del", lambda: self._prompt_delete(it["path"]), False)
+                ])
+
+            # Populate Gio.AppInfo association list for the submenu
+            if not it["is_virtual"]:
+                sub_entries = []
+                for app in self.get_applications_for_path(it["path"]):
+                    def make_app_cb(a_obj):
+                        return lambda: a_obj.launch([Gio.File.new_for_path(str(p))], None)
+                    sub_entries.append((f'Open With "{app.get_name()}"', make_app_cb(app)))
+
+                if not sub_entries:
+                    for lbl, cmd in [("Text Editor", "mousepad"), ("File Manager", "thunar"), ("Terminal", "x-terminal-emulator")]:
+                        if shutil.which(cmd):
+                            sub_entries.append((f'Open With "{lbl}"', lambda c=cmd: safe_popen([c, str(p)])))
+
+                if sub_entries:
+                    sub_entries.append(("---", None))
+                sub_entries.append(("Choose Another Application...", lambda: self.prompt_choose_another_application(it["path"])))
+                self.submenu_items = sub_entries
+
+        self.ctx.save()
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(12.0)
+
+        max_label_w = 0.0
+        max_shortcut_w = 0.0
+        for label, shortcut, _, _ in self.menu_items:
+            if label == "---":
+                continue
+            lw = self.ctx.text_extents(label).width
+            if lw > max_label_w:
+                max_label_w = lw
+            if shortcut:
+                sw = self.ctx.text_extents(shortcut).width
+                if sw > max_shortcut_w:
+                    max_shortcut_w = sw
+        self.ctx.restore()
+
+        gap = 28 if max_shortcut_w > 0 else 0
+        self.menu_w = max(240, int(max_label_w + max_shortcut_w + gap + 32))
+        self.menu_h = len(self.menu_items) * item_h + 8
+
+        self.menu_x = max(10, min(x, self.width - self.menu_w - 10))
+        self.menu_y = max(10, min(y, self.height - self.menu_h - 10))
+        self.menu_visible = True
+        self.hovered_menu_idx = -1
+        self.redraw()
+
+    def show_icons_dialog(self):
+        self.modal_active = True
+        self.modal_w, self.modal_h = 420, 330
+        self.modal_title = "Desktop Icons Configuration"
+        self.modal_desc = "Choose visible desktop icons and label text color:"
+        self.modal_buttons = []
+        dx = (self.width - self.modal_w) // 2
+        dy = (self.height - self.modal_h) // 2
+
+        icons = [
+            ("HOME", "Home Folder"),
+            ("COMPUTER", "Computer"),
+            ("NETWORK", "Network"),
+            ("TRASH", "Recycling Bin"),
+            ("BROWSER", "Web Browser"),
+        ]
+
+        for idx, (key, label) in enumerate(icons):
+            bx = dx + 30
+            by = dy + 70 + (idx * 34)
+            is_enabled = as_bool(self.config.get(key, "false"))
+            box_text = f"[{'X' if is_enabled else ' '}]   {label}"
+
+            def make_toggle_cb(k):
+                def toggle():
+                    curr = as_bool(self.config.get(k, "false"))
+                    self.config[k] = "false" if curr else "true"
+                    self._save_desktop_config()
+                    self.refresh_items()
+                    self.show_icons_dialog()
+                return toggle
+
+            self.modal_buttons.append((bx, by, 360, 26, box_text, make_toggle_cb(key)))
+
+        colors = (("#ffffff", "Light Label Text"), ("#000000", "Dark Label Text"))
+        for index, (color, label) in enumerate(colors):
+            selected = self.config.get("ICON_FONT_COLOR", "#ffffff").casefold() == color
+            button_text = f"[{'X' if selected else ' '}] {label}"
+
+            def make_color_cb(selected_color):
+                def set_color():
+                    self.config["ICON_FONT_COLOR"] = selected_color
+                    self.icon_font_color = hex_to_rgb(selected_color)
+                    self._save_desktop_config()
+                    self.show_icons_dialog()
+                return set_color
+
+            self.modal_buttons.append((dx + 30 + index * 180, dy + 240, 170, 26, button_text, make_color_cb(color)))
+
+        self.modal_buttons.append((
+            dx + self.modal_w - 110, dy + self.modal_h - 45, 85, 28, "Close",
+            lambda: [setattr(self, "modal_active", False), self.redraw()]
+        ))
+        self.redraw()
+
+    def _save_desktop_config(self):
+        DESKTOP_CONF.parent.mkdir(parents=True, exist_ok=True)
+        lines = [f'{k}="{v}"\n' for k, v in self.config.items()]
+        temp_path = DESKTOP_CONF.with_name(f".mdeon-desktop.conf-{os.getpid()}.tmp")
+        try:
+            backup_config_file(DESKTOP_CONF)
+            temp_path.write_text("".join(lines), encoding="utf-8")
+            os.replace(temp_path, DESKTOP_CONF)
+            logger.info("Saved desktop configuration.")
+        except Exception as e:
+            temp_path.unlink(missing_ok=True)
+            logger.error(f"Failed to save desktop configuration: {e}")
+
+    def _action_create_file(self):
+        cand = self.desktop_dir / "New File"
+        idx = 1
+        while cand.exists():
+            cand = self.desktop_dir / f"New File {idx}"
+            idx += 1
+        cand.touch(mode=0o644)
+        self.refresh_items()
+        self.redraw()
+
+    def _action_create_folder(self):
+        cand = self.desktop_dir / "New Folder"
+        idx = 1
+        while cand.exists():
+            cand = self.desktop_dir / f"New Folder {idx}"
+            idx += 1
+        cand.mkdir(mode=0o755)
+        self.refresh_items()
+        self.redraw()
+
+    def _action_trash(self, path):
+        if shutil.which("gio"):
+            subprocess.run(["gio", "trash", path], check=False)
+        elif shutil.which("trash-put"):
+            subprocess.run(["trash-put", path], check=False)
+        self.refresh_items()
+        self.redraw()
+
+    def _prompt_delete(self, path):
+        p = Path(path)
+        self.modal_active = True
+        self.modal_w, self.modal_h = 420, 180
+        self.modal_title = f"Delete '{p.name}' permanently?"
+        self.modal_desc = "This action cannot be undone."
+        mx = (self.width - self.modal_w) // 2
+        my = (self.height - self.modal_h) // 2
+
+        def do_delete():
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink(missing_ok=True)
+            self.modal_active = False
+            self.refresh_items()
+            self.redraw()
+
+        self.modal_buttons = [
+            (mx + 220, my + 130, 80, 30, "Cancel", lambda: [setattr(self, "modal_active", False), self.redraw()]),
+            (mx + 310, my + 130, 80, 30, "Delete", do_delete)
+        ]
+        self.redraw()
+
+    def _prompt_rename(self, path):
+        p = Path(path)
+        if shutil.which("zenity"):
+            res = subprocess.run(["zenity", "--entry", f"--entry-text={p.name}", "--title=Rename Item"], stdout=subprocess.PIPE, text=True)
+            new_name = res.stdout.strip()
+            if new_name and new_name != p.name:
+                p.rename(p.parent / new_name)
+                self.refresh_items()
+                self.redraw()
+
+    def _action_refresh(self):
+        self.config = read_mdeon_conf()
+        self.wallpaper_path = os.path.expanduser(self.config.get("WALLPAPER", "").strip())
+        self.bg_color = hex_to_rgb(self.config.get("FALLBACK_COLOR", self.config.get("MENU_BG_COLOR", "#2d2d2d")))
+        self.reload_wallpaper()
+        self.icon_theme = XdgIconTheme(target_size=self.icon_size)
+        self.refresh_items()
+        self.update_monitor_topology()
+        self.redraw()
+
+    # ------------------------------------------------------------------
+    # Rendering Loop
+    # ------------------------------------------------------------------
+    def redraw(self):
+        self.ctx.set_operator(cairo.OPERATOR_SOURCE)
+        if self.monitor_wallpapers:
+            self.ctx.set_source_rgb_raw(*self.bg_color)
+            self.ctx.paint()
+            for monitor in self.monitors:
+                self.ctx.save()
+                self.ctx.rectangle(
+                    monitor["x"], monitor["y"], monitor["width"], monitor["height"]
+                )
+                self.ctx.clip()
+                wallpaper = self.monitor_wallpapers.get(monitor["name"])
+                if wallpaper:
+                    self.ctx.set_source_surface(wallpaper, monitor["x"], monitor["y"])
+                    self.ctx.paint()
+                else:
+                    self.ctx.set_source_rgb_raw(*self.bg_color)
+                    self.ctx.paint()
+                self.ctx.restore()
+        elif self.wallpaper_surface:
+            self.ctx.set_source_surface(self.wallpaper_surface, 0, 0)
+            self.ctx.paint()
+        else:
+            self.ctx.set_source_rgb_raw(*self.bg_color)
+            self.ctx.paint()
+
+        self.ctx.set_operator(cairo.OPERATOR_OVER)
+
+        # Vertical Grid (Top-to-Bottom, Left-to-Right)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(self.font_size)
+
+        for i, it in enumerate(self.items):
+            x = it.get("x", 20)
+            y = it.get("y", 20)
+
+            ix = x + (self.cell_w - self.icon_size) // 2
+            iy = y
+
+            surf = self.icon_theme.get_cairo_surface(it["icon_name"], it["is_dir"])
+            if surf:
+                self.ctx.set_source_surface(surf, ix, iy)
+                self.ctx.paint()
+            else:
+                self._draw_vector_icon(ix, iy, it)
+
+            lines = self._split_text_to_lines(it["name"])
+            start_ty = iy + self.icon_size + self.font_size + 2
+            line_height = self.font_size + 4
+
+            if i == self.selected_idx or i in self.selected_indices:
+                self.ctx.set_source_rgba(0.2, 0.5, 0.9, 0.75)
+                max_w = max(self.ctx.text_extents(line).width for line in lines)
+                self.ctx.rectangle(
+                    x + (self.cell_w - max_w) // 2 - 6,
+                    start_ty - self.font_size + 1,
+                    max_w + 12,
+                    line_height * len(lines) + 2
+                )
+                self.ctx.fill()
+
+            for line_idx, line in enumerate(lines):
+                ext = self.ctx.text_extents(line)
+                tx = x + (self.cell_w - ext.width) // 2
+                ty = start_ty + line_idx * line_height
+
+                shadow_color = (0.0, 0.0, 0.0) if sum(self.icon_font_color) > 1.5 else (1.0, 1.0, 1.0)
+                self.ctx.set_source_rgba_raw(*shadow_color, 0.9)
+                self.ctx.move_to(tx + 1, ty + 1)
+                self.ctx.show_text(line)
+
+                self.ctx.set_source_rgb_raw(*self.icon_font_color)
+                self.ctx.move_to(tx, ty)
+                self.ctx.show_text(line)
+
+        if self.rubberbanding:
+            rx, ry, rw, rh = self.rubberband_rect
+            self.ctx.set_source_rgba(0.2, 0.5, 0.9, 0.22)
+            self.ctx.rectangle(rx, ry, rw, rh)
+            self.ctx.fill()
+            self.ctx.set_source_rgba(0.2, 0.5, 0.9, 0.85)
+            self.ctx.set_line_width(1)
+            self.ctx.rectangle(rx, ry, rw, rh)
+            self.ctx.stroke()
+
+        if self.menu_visible:
+            self._draw_menu()
+
+        if self.submenu_visible:
+            self._draw_submenu()
+
+        if self.modal_active:
+            self._draw_modal()
+
+        self.surface.flush()
+        self.flush_cb()
+
+    def _draw_vector_icon(self, x, y, item):
+        sz = self.icon_size
+        self.ctx.save()
+        if item["is_virtual"]:
+            k = item["vkey"]
+            if k == "HOME":
+                self.ctx.set_source_rgb(0.3, 0.65, 0.95)
+                self.ctx.arc(x + sz/2, y + sz/2, sz/2 - 2, 0, 2*math.pi)
+                self.ctx.fill()
+            elif k == "TRASH":
+                has_trash = TRASH_FILES_DIR.exists() and any(TRASH_FILES_DIR.iterdir())
+                self.ctx.set_source_rgb(0.85, 0.3, 0.3 if has_trash else 0.6)
+                self.ctx.rectangle(x + 4, y + 6, sz - 8, sz - 6)
+                self.ctx.fill()
+            elif k == "BROWSER":
+                self.ctx.set_source_rgb(0.2, 0.75, 0.5)
+                self.ctx.arc(x + sz/2, y + sz/2, sz/2 - 2, 0, 2*math.pi)
+                self.ctx.fill()
+            else:
+                self.ctx.set_source_rgb(0.5, 0.5, 0.6)
+                self.ctx.rectangle(x + 4, y + 4, sz - 8, sz - 8)
+                self.ctx.fill()
+        elif item["is_dir"]:
+            self.ctx.set_source_rgb(0.92, 0.76, 0.25)
+            self.ctx.rectangle(x, y + 6, sz, sz - 6)
+            self.ctx.fill()
+            self.ctx.rectangle(x, y, sz // 2, 6)
+            self.ctx.fill()
+        else:
+            self.ctx.set_source_rgb(0.85, 0.85, 0.85)
+            self.ctx.rectangle(x + 4, y, sz - 8, sz)
+            self.ctx.fill()
+            self.ctx.set_source_rgb(0.5, 0.5, 0.5)
+            self.ctx.set_line_width(1)
+            self.ctx.rectangle(x + 4, y, sz - 8, sz)
+            self.ctx.stroke()
+        self.ctx.restore()
+
+    def _draw_menu(self):
+        item_h = 28
+        self.ctx.save()
+
+        # Shadow
+        self.ctx.set_source_rgba(0, 0, 0, 0.45)
+        self.ctx.rectangle(self.menu_x + 3, self.menu_y + 3, self.menu_w, self.menu_h)
+        self.ctx.fill()
+
+        # Background
+        self.ctx.set_source_rgb(0.18, 0.18, 0.18)
+        self.ctx.rectangle(self.menu_x, self.menu_y, self.menu_w, self.menu_h)
+        self.ctx.fill()
+
+        # Border
+        self.ctx.set_source_rgb(0.35, 0.35, 0.35)
+        self.ctx.set_line_width(1)
+        self.ctx.rectangle(self.menu_x, self.menu_y, self.menu_w, self.menu_h)
+        self.ctx.stroke()
+
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(12.0)
+
+        for i, (label, shortcut, _, has_sub) in enumerate(self.menu_items):
+            iy = self.menu_y + 4 + (i * item_h)
+            if label == "---":
+                self.ctx.set_source_rgb(0.32, 0.32, 0.32)
+                self.ctx.move_to(self.menu_x + 6, iy + item_h // 2)
+                self.ctx.line_to(self.menu_x + self.menu_w - 6, iy + item_h // 2)
+                self.ctx.stroke()
+                continue
+
+            if i == self.hovered_menu_idx:
+                self.ctx.set_source_rgba(0.2, 0.5, 0.9, 0.7)
+                self.ctx.rectangle(self.menu_x + 2, iy, self.menu_w - 4, item_h)
+                self.ctx.fill()
+
+            self.ctx.set_source_rgb(0.95, 0.95, 0.95)
+            self.ctx.move_to(self.menu_x + 12, iy + 18)
+            self.ctx.show_text(label)
+
+            if shortcut:
+                ext_s = self.ctx.text_extents(shortcut)
+                self.ctx.set_source_rgb(0.65, 0.65, 0.65)
+                self.ctx.move_to(self.menu_x + self.menu_w - ext_s.width - 14, iy + 18)
+                self.ctx.show_text(shortcut)
+
+        self.ctx.restore()
+
+    def _draw_submenu(self):
+        item_h = 28
+        self.ctx.save()
+
+        # Shadow
+        self.ctx.set_source_rgba(0, 0, 0, 0.45)
+        self.ctx.rectangle(self.submenu_x + 3, self.submenu_y + 3, self.submenu_w, self.submenu_h)
+        self.ctx.fill()
+
+        # Background
+        self.ctx.set_source_rgb(0.20, 0.20, 0.20)
+        self.ctx.rectangle(self.submenu_x, self.submenu_y, self.submenu_w, self.submenu_h)
+        self.ctx.fill()
+
+        # Border
+        self.ctx.set_source_rgb(0.40, 0.40, 0.40)
+        self.ctx.set_line_width(1)
+        self.ctx.rectangle(self.submenu_x, self.submenu_y, self.submenu_w, self.submenu_h)
+        self.ctx.stroke()
+
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(12.0)
+
+        for i, (label, _) in enumerate(self.submenu_items):
+            iy = self.submenu_y + 4 + (i * item_h)
+            if label == "---":
+                self.ctx.set_source_rgb(0.32, 0.32, 0.32)
+                self.ctx.move_to(self.submenu_x + 6, iy + item_h // 2)
+                self.ctx.line_to(self.submenu_x + self.submenu_w - 6, iy + item_h // 2)
+                self.ctx.stroke()
+                continue
+
+            if i == self.hovered_submenu_idx:
+                self.ctx.set_source_rgba(0.2, 0.5, 0.9, 0.7)
+                self.ctx.rectangle(self.submenu_x + 2, iy, self.submenu_w - 4, item_h)
+                self.ctx.fill()
+
+            self.ctx.set_source_rgb(0.95, 0.95, 0.95)
+            self.ctx.move_to(self.submenu_x + 12, iy + 18)
+            self.ctx.show_text(label[:38])
+
+        self.ctx.restore()
+
+    def _draw_modal(self):
+        mw, mh = self.modal_w, self.modal_h
+        mx = (self.width - mw) // 2
+        my = (self.height - mh) // 2
+
+        self.ctx.set_source_rgba(0, 0, 0, 0.55)
+        self.ctx.rectangle(0, 0, self.width, self.height)
+        self.ctx.fill()
+
+        self.ctx.set_source_rgb(0.18, 0.18, 0.20)
+        self.ctx.rectangle(mx, my, mw, mh)
+        self.ctx.fill()
+        self.ctx.set_source_rgb(0.4, 0.4, 0.4)
+        self.ctx.set_line_width(1)
+        self.ctx.rectangle(mx, my, mw, mh)
+        self.ctx.stroke()
+
+        self.ctx.set_font_size(14.0)
+        self.ctx.set_source_rgb(1.0, 1.0, 1.0)
+        self.ctx.move_to(mx + 20, my + 30)
+        self.ctx.show_text(self.modal_title)
+
+        self.ctx.set_font_size(11.0)
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        lines = self.modal_desc.splitlines()
+        for idx, line in enumerate(lines[:3]):
+            self.ctx.move_to(mx + 20, my + 54 + (idx * 16))
+            self.ctx.show_text(line[:64])
+
+        for bx, by, bw, bh, blabel, _ in self.modal_buttons:
+            self.ctx.set_source_rgba(0.3, 0.3, 0.35, 0.9)
+            self.ctx.rectangle(bx, by, bw, bh)
+            self.ctx.fill()
+            self.ctx.set_source_rgb(1, 1, 1)
+            self.ctx.move_to(bx + 10, by + 18)
+            self.ctx.show_text(blabel)
+
+    # ------------------------------------------------------------------
+    # User Input & Submenu Tracking
+    # ------------------------------------------------------------------
+    def get_item_at(self, x, y):
+        for i in range(len(self.items)):
+            ix = self.items[i].get("x", 20)
+            iy = self.items[i].get("y", 20)
+            if ix <= x <= ix + self.cell_w and iy <= y <= iy + self.cell_h:
+                return i
+        return -1
+
+    def handle_motion(self, x, y):
+        if self.drag_candidate is not None:
+            dx = x - self.drag_start[0]
+            dy = y - self.drag_start[1]
+            if self.dragging or abs(dx) + abs(dy) >= 6:
+                self.dragging = True
+                for index, origin in self.drag_item_origins.items():
+                    self.items[index]["x"] = origin["x"] + dx
+                    self.items[index]["y"] = origin["y"] + dy
+                self.redraw()
+            return
+
+        if self.rubberbanding:
+            sx, sy = self.rubberband_start
+            left, top = min(sx, x), min(sy, y)
+            right, bottom = max(sx, x), max(sy, y)
+            self.rubberband_rect = (left, top, right - left, bottom - top)
+            self.selected_indices = {
+                index for index, item in enumerate(self.items)
+                if item["x"] <= right
+                and item["x"] + self.cell_w >= left
+                and item["y"] <= bottom
+                and item["y"] + self.cell_h >= top
+            }
+            self.selected_idx = next(iter(self.selected_indices), -1)
+            self.redraw()
+            return
+
+        if not self.menu_visible:
+            return
+
+        if self.menu_x <= x <= self.menu_x + self.menu_w and self.menu_y <= y <= self.menu_y + self.menu_h:
+            idx = (y - (self.menu_y + 4)) // 28
+            if 0 <= idx < len(self.menu_items):
+                if self.hovered_menu_idx != idx:
+                    self.hovered_menu_idx = idx
+                    label, _, _, has_sub = self.menu_items[idx]
+
+                    if has_sub and self.submenu_items:
+                        item_h = 28
+                        self.submenu_h = len(self.submenu_items) * item_h + 8
+                        if self.menu_x + self.menu_w + self.submenu_w + 10 < self.width:
+                            self.submenu_x = self.menu_x + self.menu_w + 2
+                        else:
+                            self.submenu_x = self.menu_x - self.submenu_w - 2
+                        self.submenu_y = min(self.menu_y + (idx * item_h), self.height - self.submenu_h - 10)
+                        self.submenu_visible = True
+                    else:
+                        self.submenu_visible = False
+                    self.redraw()
+            return
+
+        if self.submenu_visible:
+            if self.submenu_x <= x <= self.submenu_x + self.submenu_w and self.submenu_y <= y <= self.submenu_y + self.submenu_h:
+                idx = (y - (self.submenu_y + 4)) // 28
+                if 0 <= idx < len(self.submenu_items):
+                    if self.hovered_submenu_idx != idx:
+                        self.hovered_submenu_idx = idx
+                        self.redraw()
+                return
+
+    def handle_click(self, x, y, button, state=0):
+        now = time.monotonic()
+        if self.modal_active:
+            for bx, by, bw, bh, _, cb in self.modal_buttons:
+                if bx <= x <= bx + bw and by <= y <= by + bh:
+                    cb()
+                    return
+            return
+
+        if self.submenu_visible:
+            if self.submenu_x <= x <= self.submenu_x + self.submenu_w and self.submenu_y <= y <= self.submenu_y + self.submenu_h:
+                idx = (y - (self.submenu_y + 4)) // 28
+                if 0 <= idx < len(self.submenu_items):
+                    _, action = self.submenu_items[idx]
+                    self.submenu_visible = False
+                    self.menu_visible = False
+                    if action:
+                        action()
+                    self.redraw()
+                    return
+
+        if self.menu_visible:
+            if self.menu_x <= x <= self.menu_x + self.menu_w and self.menu_y <= y <= self.menu_y + self.menu_h:
+                idx = (y - (self.menu_y + 4)) // 28
+                if 0 <= idx < len(self.menu_items):
+                    entry = self.menu_items[idx]
+                    has_sub = entry[3]
+                    if not has_sub:
+                        action = entry[2]
+                        self.menu_visible = False
+                        self.submenu_visible = False
+                        if action:
+                            action()
+                        self.redraw()
+                        return
+                    else:
+                        return
+            self.menu_visible = False
+            self.submenu_visible = False
+            self.redraw()
+
+        idx = self.get_item_at(x, y)
+        if button == 1:
+            is_shift = bool(state & 1)
+            is_ctrl = bool(state & 4)
+            if idx == -1:
+                self.selected_idx = -1
+                if not is_shift and not is_ctrl:
+                    self.selected_indices.clear()
+                self.rubberbanding = True
+                self.rubberband_start = (x, y)
+                self.rubberband_rect = (x, y, 0, 0)
+                self.redraw()
+                return
+            is_double_click = idx == self.selected_idx and (now - self.last_click_time) < 0.35
+            if is_double_click:
+                self.drag_candidate = None
+                self.rubberbanding = False
+                self.launch_item(self.items[idx])
+                self.last_click_time = now
+                return
+            if is_ctrl and idx in self.selected_indices:
+                self.selected_indices.remove(idx)
+            elif is_shift or is_ctrl:
+                self.selected_indices.add(idx)
+            elif idx not in self.selected_indices:
+                self.selected_indices = {idx}
+            self.selected_idx = idx
+            self.drag_candidate = idx
+            self.dragging = False
+            self.drag_start = (x, y)
+            self.drag_item_origins = {
+                selected: {
+                    "x": self.items[selected]["x"],
+                    "y": self.items[selected]["y"],
+                    "col": self.items[selected]["col"],
+                    "row": self.items[selected]["row"],
+                    "monitor": self.items[selected]["effective_monitor"],
+                }
+                for selected in self.selected_indices
+            }
+            self.redraw()
+            self.last_click_time = now
+        elif button == 3:
+            if idx != -1:
+                self.selected_idx = idx
+                if idx not in self.selected_indices:
+                    self.selected_indices = {idx}
+                self.show_context_menu(x, y, is_desktop=False)
+            else:
+                self.selected_idx = -1
+                self.show_context_menu(x, y, is_desktop=True)
+
+    def handle_release(self, x, y, button):
+        if button != 1:
+            return
+
+        if self.dragging and self.drag_candidate is not None:
+            target = next((
+                monitor for monitor in self.monitors
+                if monitor["x"] <= x < monitor["x"] + monitor["width"]
+                and monitor["y"] <= y < monitor["y"] + monitor["height"]
+            ), None)
+            if target and len(self.monitors) > 1:
+                anchor = self.drag_item_origins[self.drag_candidate]
+                target_col = max(0, (x - target["x"] - 20) // self.cell_w)
+                target_row = max(0, (y - target["y"] - 20) // self.cell_h)
+                assignments = self.layout_config.setdefault("icon_assignments", {})
+                for index in self.selected_indices:
+                    origin = self.drag_item_origins[index]
+                    assignments[self.items[index]["layout_id"]] = {
+                        "monitor": target["name"],
+                        "col": max(0, target_col + origin["col"] - anchor["col"]),
+                        "row": max(0, target_row + origin["row"] - anchor["row"]),
+                    }
+                try:
+                    save_desktop_layout(self.layout_config)
+                except OSError as exc:
+                    logger.warning("Could not save icon positions: %s", exc)
+            self.layout_icons()
+
+        was_rubberbanding = self.rubberbanding
+        had_rubberband_motion = self.rubberband_rect[2] > 3 or self.rubberband_rect[3] > 3
+        self.rubberbanding = False
+        self.drag_candidate = None
+        self.dragging = False
+        self.drag_item_origins = {}
+        if was_rubberbanding and not had_rubberband_motion and len(self.monitors) > 1:
+            self.show_context_menu(x, y, is_desktop=True)
+        else:
+            self.redraw()
+
+    def handle_key(self, keysym, state=0):
+        is_shift = bool(state & 1)
+        is_ctrl = bool(state & 4)
+
+        if keysym == 0xff1b:  # Escape
+            if self.modal_active:
+                self.modal_active = False
+            elif self.submenu_visible:
+                self.submenu_visible = False
+            elif self.menu_visible:
+                self.menu_visible = False
+            else:
+                self.selected_idx = -1
+            self.redraw()
+            return
+
+        if self.modal_active or self.menu_visible or not self.items:
+            return
+
+        rows_per_col = max(1, (self.height - 40) // self.cell_h)
+        last_index = len(self.items) - 1
+        current = self.selected_idx if self.selected_idx >= 0 else 0
+
+        if keysym == 0xff52:  # Up
+            self.selected_idx = max(0, current - 1)
+        elif keysym == 0xff54:  # Down
+            self.selected_idx = min(last_index, current + 1)
+        elif keysym == 0xff51:  # Left
+            self.selected_idx = max(0, current - rows_per_col)
+        elif keysym == 0xff53:  # Right
+            self.selected_idx = min(last_index, current + rows_per_col)
+        elif keysym == 0xff50:  # Home
+            self.selected_idx = 0
+        elif keysym == 0xff57:  # End
+            self.selected_idx = last_index
+        elif keysym in (0xff0d, 0xff8d):  # Return / Enter
+            self.launch_item(self.items[current])
+            return
+        elif keysym == 0xffbf:  # F2 (Rename)
+            item = self.items[current]
+            if not item["is_virtual"]:
+                self._prompt_rename(item["path"])
+            return
+        elif keysym == 0xffff:  # Delete
+            item = self.items[current]
+            if not item["is_virtual"]:
+                if is_shift:
+                    self._prompt_delete(item["path"])
+                else:
+                    self._action_trash(item["path"])
+            return
+        elif keysym == 0xffc2 or (is_ctrl and keysym in (ord("r"), ord("R"))):  # F5 or Ctrl+R
+            self._action_refresh()
+            return
+        elif 32 <= keysym <= 126 and not is_ctrl:
+            now = time.monotonic()
+            char = chr(keysym).lower()
+            if now - self.last_key_search_time > 0.8:
+                self.key_search_buffer = char
+            else:
+                self.key_search_buffer += char
+            self.last_key_search_time = now
+
+            for index, item in enumerate(self.items):
+                if item["name"].lower().startswith(self.key_search_buffer):
+                    self.selected_idx = index
+                    break
+
+        self.redraw()
+
+
+# ----------------------------------------------------------------------
+# libX11 C Bindings & X11 Runner
+# ----------------------------------------------------------------------
+try:
+    x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+except OSError:
+    try:
+        x11 = ctypes.cdll.LoadLibrary("libX11.so")
+    except OSError:
+        x11 = None
+
+if x11:
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XDefaultScreen.restype = ctypes.c_int
+    x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+    x11.XRootWindow.restype = ctypes.c_ulong
+    x11.XRootWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDefaultVisual.restype = ctypes.c_void_p
+    x11.XDefaultVisual.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDefaultDepth.restype = ctypes.c_int
+    x11.XDefaultDepth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDisplayWidth.restype = ctypes.c_int
+    x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDisplayHeight.restype = ctypes.c_int
+    x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XCreateSimpleWindow.restype = ctypes.c_ulong
+    x11.XCreateSimpleWindow.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_ulong
+    ]
+    x11.XCreateGC.restype = ctypes.c_void_p
+    x11.XCreateGC.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+    x11.XCreateImage.restype = ctypes.c_void_p
+    x11.XCreateImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_int,
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int
+    ]
+    x11.XPutImage.restype = ctypes.c_int
+    x11.XPutImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint
+    ]
+    x11.XSelectInput.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long]
+    x11.XMapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XResizeWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_uint, ctypes.c_uint]
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XPending.restype = ctypes.c_int
+    x11.XPending.argtypes = [ctypes.c_void_p]
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XChangeProperty.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int
+    ]
+    x11.XKeycodeToKeysym.restype = ctypes.c_ulong
+    x11.XKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int]
+    x11.XChangeWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+    x11.XLowerWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XStoreName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_char_p]
+
+    class XSetWindowAttributes(ctypes.Structure):
+        _fields_ = [
+            ("background_pixmap", ctypes.c_ulong),
+            ("background_pixel", ctypes.c_ulong),
+            ("border_pixmap", ctypes.c_ulong),
+            ("border_pixel", ctypes.c_ulong),
+            ("bit_gravity", ctypes.c_int),
+            ("win_gravity", ctypes.c_int),
+            ("backing_store", ctypes.c_int),
+            ("backing_planes", ctypes.c_ulong),
+            ("backing_pixel", ctypes.c_ulong),
+            ("save_under", ctypes.c_int),
+            ("event_mask", ctypes.c_long),
+            ("do_not_propagate_mask", ctypes.c_long),
+            ("override_redirect", ctypes.c_int),
+            ("colormap", ctypes.c_ulong),
+            ("cursor", ctypes.c_ulong),
+        ]
+
+    class XEvent(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("pad", ctypes.c_long * 24)]
+
+    class XButtonEvent(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+            ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+            ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+            ("state", ctypes.c_uint), ("button", ctypes.c_uint), ("same_screen", ctypes.c_int)
+        ]
+
+    class XMotionEvent(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+            ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+            ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+            ("state", ctypes.c_uint), ("is_hint", ctypes.c_char), ("same_screen", ctypes.c_int)
+        ]
+
+    class XKeyEvent(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+            ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+            ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+            ("state", ctypes.c_uint), ("keycode", ctypes.c_uint), ("same_screen", ctypes.c_int)
+        ]
+
+
+def run_x11():
+    logger.info("Initializing Native X11 Backend...")
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise RuntimeError("Failed to open X11 Display.")
+
+    screen = x11.XDefaultScreen(display)
+    root = x11.XRootWindow(display, screen)
+    visual = x11.XDefaultVisual(display, screen)
+    depth = x11.XDefaultDepth(display, screen)
+    width = x11.XDisplayWidth(display, screen)
+    height = x11.XDisplayHeight(display, screen)
+
+    win = x11.XCreateSimpleWindow(display, root, 0, 0, width, height, 0, 0, 0x1e1e1e)
+    gc = x11.XCreateGC(display, win, 0, None)
+
+    # Set application names for window manager and monitors
+    x11.XStoreName(display, win, b"mdeon-desktop")
+    atom_class = x11.XInternAtom(display, b"WM_CLASS", 0)
+    x11.XChangeProperty(display, win, atom_class, 31, 8, 0, b"mdeon-desktop\0mdeon-desktop\0", 28)
+
+    # Keep direct X11 behavior unchanged; Xwayland must let the compositor manage this window.
+    is_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+
+    # Strip any window manager decorations via Motif hints
+    atom_motif = x11.XInternAtom(display, b"_MOTIF_WM_HINTS", 0)
+    motif_hints = (ctypes.c_ulong * 5)(2, 0, 0, 0, 0)
+    x11.XChangeProperty(display, win, atom_motif, atom_motif, 32, 0, motif_hints, 5)
+
+    atom_type = x11.XInternAtom(display, b"_NET_WM_WINDOW_TYPE", 0)
+    atom_desktop = x11.XInternAtom(display, b"_NET_WM_WINDOW_TYPE_DESKTOP", 0)
+    x11.XChangeProperty(display, win, atom_type, 4, 32, 0, (ctypes.c_ulong * 1)(atom_desktop), 1)
+
+    if is_wayland:
+        atom_wm_desktop = x11.XInternAtom(display, b"_NET_WM_DESKTOP", 0)
+        x11.XChangeProperty(
+            display,
+            win,
+            atom_wm_desktop,
+            6,
+            32,
+            0,
+            (ctypes.c_ulong * 1)(0xFFFFFFFF),
+            1,
+        )
+
+    atom_state = x11.XInternAtom(display, b"_NET_WM_STATE", 0)
+    atom_below = x11.XInternAtom(display, b"_NET_WM_STATE_BELOW", 0)
+    atom_skip_taskbar = x11.XInternAtom(display, b"_NET_WM_STATE_SKIP_TASKBAR", 0)
+    atom_skip_pager = x11.XInternAtom(display, b"_NET_WM_STATE_SKIP_PAGER", 0)
+    atom_sticky = x11.XInternAtom(display, b"_NET_WM_STATE_STICKY", 0)
+    states = (ctypes.c_ulong * 4)(atom_below, atom_skip_taskbar, atom_skip_pager, atom_sticky)
+    x11.XChangeProperty(display, win, atom_state, 4, 32, 0, states, 4)
+
+    # Pin directly behind all client windows
+    x11.XLowerWindow(display, win)
+
+    # Enable PointerMotionMask (1 << 6) for flyout submenu tracking
+    x11.XSelectInput(display, win, (1 << 0) | (1 << 15) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 17))
+    x11.XMapWindow(display, win)
+    x11.XLowerWindow(display, win)
+    x11.XFlush(display)
+
+    desktop = None
+    def flush():
+        x11.XPutImage(display, win, gc, desktop.ximage, 0, 0, 0, 0, width, height)
+        x11.XFlush(display)
+
+    desktop = MdeonCoreDesktop(width, height, flush)
+    c_data = (ctypes.c_char * (desktop.stride * height)).from_buffer(desktop.data_buffer)
+    desktop.ximage = x11.XCreateImage(
+        display, visual, depth, 2, 0, ctypes.addressof(c_data), width, height, 32, desktop.stride
+    )
+
+    desktop.redraw()
+    ev = XEvent()
+    last_poll = time.monotonic()
+    last_size_check = last_poll
+
+    while True:
+        while x11.XPending(display):
+            x11.XNextEvent(display, ctypes.byref(ev))
+            if ev.type == 12:  # Expose
+                desktop.redraw()
+            elif ev.type == 6:  # MotionNotify
+                mev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XMotionEvent)).contents
+                desktop.handle_motion(mev.x, mev.y)
+            elif ev.type == 4:  # ButtonPress
+                bev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XButtonEvent)).contents
+                desktop.handle_click(bev.x, bev.y, bev.button, bev.state)
+            elif ev.type == 5:  # ButtonRelease
+                bev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XButtonEvent)).contents
+                desktop.handle_release(bev.x, bev.y, bev.button)
+            elif ev.type == 2:  # KeyPress
+                kev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XKeyEvent)).contents
+                keysym = x11.XKeycodeToKeysym(display, kev.keycode, 0)
+                desktop.handle_key(keysym, kev.state)
+
+        now = time.monotonic()
+        if now - last_poll >= 0.5:
+            desktop.check_auto_refresh()
+            last_poll = now
+        if now - last_size_check >= 2.0:
+            new_width = x11.XDisplayWidth(display, screen)
+            new_height = x11.XDisplayHeight(display, screen)
+            if new_width != width or new_height != height:
+                width, height = new_width, new_height
+                x11.XResizeWindow(display, win, width, height)
+                desktop.width, desktop.height = width, height
+                desktop._init_cairo()
+                desktop.reload_wallpaper()
+                desktop.update_monitor_topology()
+                c_data = (ctypes.c_char * (desktop.stride * height)).from_buffer(desktop.data_buffer)
+                desktop.ximage = x11.XCreateImage(
+                    display, visual, depth, 2, 0, ctypes.addressof(c_data),
+                    width, height, 32, desktop.stride
+                )
+                desktop.redraw()
+            last_size_check = now
+        time.sleep(0.02)
+
+
+# ----------------------------------------------------------------------
+# Wayland Layer-Shell Runner
+# ----------------------------------------------------------------------
+def run_wayland():
+    if not HAVE_WAYLAND:
+        raise RuntimeError("Wayland requested, but pywayland is not installed")
+
+    logger.info("Initializing Wayland Layer-Shell Backend...")
+    wl_display = WlDisplay()
+    wl_display.connect()
+    logger.debug("Connected to Wayland display %s", os.environ.get("WAYLAND_DISPLAY", "wayland-0"))
+
+    registry = wl_display.get_registry()
+    state = {
+        "compositor": None,
+        "shm": None,
+        "layer_shell": None,
+        "layer_shell_version": 0,
+        "cursor_shape_manager": None,
+        "seat": None,
+        "seat_global": None,
+        "pointer": None,
+        "cursor_shape_device": None,
+        "keyboard": None,
+        "xkb_context": xkb.xkb_context_new(0) if xkb else None,
+        "xkb_keymap": None,
+        "xkb_state": None,
+        "modifiers": 0,
+    }
+    pointer_position = [0, 0]
+
+    def registry_global(reg, id_, interface, version):
+        logger.debug("Wayland global: id=%s interface=%s version=%s", id_, interface, version)
+        if interface == "wl_compositor":
+            state["compositor"] = reg.bind(id_, WlCompositor, min(version, 4))
+        elif interface == "wl_shm":
+            state["shm"] = reg.bind(id_, WlShm, 1)
+        elif interface == "zwlr_layer_shell_v1":
+            state["layer_shell_version"] = min(version, 4)
+            state["layer_shell"] = reg.bind(id_, ZwlrLayerShellV1, state["layer_shell_version"])
+        elif interface == "wl_seat":
+            state["seat_global"] = (id_, min(version, 7))
+        elif interface == "wp_cursor_shape_manager_v1" and WpCursorShapeManagerV1:
+            state["cursor_shape_manager"] = reg.bind(
+                id_, WpCursorShapeManagerV1, min(version, 2)
+            )
+
+    registry.dispatcher["global"] = registry_global
+    wl_display.roundtrip()
+    logger.debug(
+        "Wayland globals bound: compositor=%s shm=%s layer_shell=%s",
+        state["compositor"] is not None,
+        state["shm"] is not None,
+        state["layer_shell"] is not None,
+    )
+
+    if not state["layer_shell"]:
+        raise RuntimeError("No layer_shell support found on compositor")
+
+    surface = state["compositor"].create_surface()
+    layer_surface = state["layer_shell"].get_layer_surface(
+        surface, None, 1, "desktop"
+    )
+    layer_surface.set_size(0, 0)
+    layer_surface.set_anchor(1 | 2 | 4 | 8)
+    if state["layer_shell_version"] >= 4:
+        layer_surface.set_keyboard_interactivity(2)
+    logger.debug("Layer surface requested on bottom layer with all-edge anchors")
+
+    configured = False
+    closed = False
+    desktop = None
+    wayland_buffers = []
+    frame_pending = False
+
+    def pointer_enter(_pointer, serial, _surface, surface_x, surface_y):
+        pointer_position[:] = [int(surface_x), int(surface_y)]
+        logger.debug("Pointer entered at %s,%s", *pointer_position)
+        if state["cursor_shape_device"] is not None:
+            state["cursor_shape_device"].set_shape(
+                serial, WpCursorShapeDeviceV1.shape.default
+            )
+            wl_display.flush()
+            logger.debug("Reset Wayland pointer cursor to default")
+
+    def pointer_leave(_pointer, _serial, _surface):
+        logger.debug("Pointer left desktop surface")
+
+    def pointer_motion(_pointer, _time, surface_x, surface_y):
+        pointer_position[:] = [int(surface_x), int(surface_y)]
+        if desktop is not None:
+            desktop.handle_motion(*pointer_position)
+
+    def pointer_button(_pointer, _serial, _time, button, button_state):
+        if desktop is None:
+            return
+        button_map = {272: 1, 273: 3, 274: 2}
+        mapped_button = button_map.get(button)
+        if mapped_button is not None and button_state == 1:
+            logger.debug("Pointer button %s at %s,%s", mapped_button, *pointer_position)
+            desktop.handle_click(*pointer_position, mapped_button, state["modifiers"])
+        elif mapped_button is not None:
+            desktop.handle_release(*pointer_position, mapped_button)
+
+    def keyboard_keymap(_keyboard, format_value, fd, size):
+        try:
+            if format_value != WlKeyboard.keymap_format.xkb_v1 or not xkb or not state["xkb_context"]:
+                logger.warning("Native keyboard input unavailable: unsupported keymap or libxkbcommon missing")
+                return
+            with mmap.mmap(fd, size, access=mmap.ACCESS_READ) as keymap_file:
+                keymap_text = keymap_file.read()
+            keymap = xkb.xkb_keymap_new_from_string(state["xkb_context"], keymap_text, 1, 0)
+            if not keymap:
+                logger.warning("Could not load compositor XKB keymap")
+                return
+            keyboard_state = xkb.xkb_state_new(keymap)
+            if not keyboard_state:
+                xkb.xkb_keymap_unref(keymap)
+                logger.warning("Could not create XKB keyboard state")
+                return
+            if state["xkb_state"]:
+                xkb.xkb_state_unref(state["xkb_state"])
+            if state["xkb_keymap"]:
+                xkb.xkb_keymap_unref(state["xkb_keymap"])
+            state["xkb_keymap"] = keymap
+            state["xkb_state"] = keyboard_state
+            logger.debug("Loaded compositor XKB keymap (%s bytes)", size)
+        finally:
+            os.close(fd)
+
+    def keyboard_modifiers(_keyboard, _serial, depressed, latched, locked, group):
+        if xkb and state["xkb_state"]:
+            xkb.xkb_state_update_mask(state["xkb_state"], depressed, latched, locked, 0, 0, group)
+            modifiers = 0
+            if xkb.xkb_state_mod_name_is_active(state["xkb_state"], b"Shift", 1):
+                modifiers |= 1
+            if xkb.xkb_state_mod_name_is_active(state["xkb_state"], b"Control", 1):
+                modifiers |= 4
+            state["modifiers"] = modifiers
+        else:
+            state["modifiers"] = 0
+
+    def keyboard_key(_keyboard, _serial, _time, key, key_state):
+        if desktop is None or key_state != 1:
+            return
+        keysym = 0
+        if xkb and state["xkb_state"]:
+            keysym = xkb.xkb_state_key_get_one_sym(state["xkb_state"], key + 8)
+        if not keysym:
+            keysym = EVDEV_TO_KEYSYM.get(key, 0)
+        if keysym:
+            logger.debug("Keyboard key %s translated to keysym 0x%x", key, keysym)
+            desktop.handle_key(keysym, state["modifiers"])
+
+    def seat_capabilities(_seat, capabilities):
+        if capabilities & 1 and state["pointer"] is None:
+            pointer = state["seat"].get_pointer()
+            pointer.dispatcher["enter"] = pointer_enter
+            pointer.dispatcher["leave"] = pointer_leave
+            pointer.dispatcher["motion"] = pointer_motion
+            pointer.dispatcher["button"] = pointer_button
+            state["pointer"] = pointer
+            if state["cursor_shape_manager"] is not None:
+                state["cursor_shape_device"] = state["cursor_shape_manager"].get_pointer(pointer)
+                logger.debug("Bound Wayland cursor-shape device")
+            logger.debug("Bound Wayland pointer")
+        elif not capabilities & 1 and state["pointer"] is not None:
+            if state["cursor_shape_device"] is not None:
+                state["cursor_shape_device"].destroy()
+                state["cursor_shape_device"] = None
+            state["pointer"].destroy()
+            state["pointer"] = None
+            logger.debug("Unbound Wayland pointer")
+
+        if capabilities & 2 and state["keyboard"] is None:
+            keyboard = state["seat"].get_keyboard()
+            keyboard.dispatcher["keymap"] = keyboard_keymap
+            keyboard.dispatcher["key"] = keyboard_key
+            keyboard.dispatcher["modifiers"] = keyboard_modifiers
+            state["keyboard"] = keyboard
+            logger.debug("Bound Wayland keyboard")
+        elif not capabilities & 2 and state["keyboard"] is not None:
+            state["keyboard"].destroy()
+            state["keyboard"] = None
+            logger.debug("Unbound Wayland keyboard")
+
+    def create_buffer(width, height):
+        stride = width * 4
+        size = stride * height
+        if hasattr(os, "memfd_create"):
+            fd = os.memfd_create("mdeon-desktop", os.MFD_CLOEXEC)
+            close_file = None
+        else:
+            close_file = tempfile.TemporaryFile()
+            fd = close_file.fileno()
+
+        os.ftruncate(fd, size)
+        mapped = mmap.mmap(fd, size, access=mmap.ACCESS_WRITE)
+        pool = state["shm"].create_pool(fd, size)
+        buffer = pool.create_buffer(
+            0, width, height, stride, WlShm.format.xrgb8888
+        )
+        pool.destroy()
+        logger.debug("Created SHM buffer: width=%s height=%s stride=%s bytes=%s", width, height, stride, size)
+        if close_file is None:
+            os.close(fd)
+        else:
+            close_file.close()
+        return {
+            "width": width,
+            "height": height,
+            "stride": stride,
+            "mapping": mapped,
+            "buffer": buffer,
+            "busy": False,
+            "dirty": False,
+        }
+
+    def present():
+        nonlocal frame_pending
+        if not configured or desktop is None or not wayland_buffers:
+            return
+
+        buffer_state = next(
+            (candidate for candidate in wayland_buffers if not candidate["busy"]),
+            None,
+        )
+        if buffer_state is None:
+            frame_pending = True
+            logger.debug("Presentation deferred because the current buffer is busy")
+            return
+
+        data = bytes(desktop.data_buffer)
+        buffer_state["mapping"][: len(data)] = data
+        buffer_state["mapping"].flush()
+        buffer_state["buffer"].dispatcher["release"] = (
+            lambda _buffer, released=buffer_state: on_buffer_release(released)
+        )
+        surface.attach(buffer_state["buffer"], 0, 0)
+        surface.damage(0, 0, buffer_state["width"], buffer_state["height"])
+        buffer_state["busy"] = True
+        frame_pending = False
+        surface.commit()
+        wl_display.flush()
+        logger.debug("Presented frame: %sx%s", buffer_state["width"], buffer_state["height"])
+
+    def on_buffer_release(buffer_state):
+        nonlocal frame_pending
+        buffer_state["busy"] = False
+        logger.debug("Compositor released the SHM buffer")
+        if frame_pending:
+            present()
+
+    def on_configure(_layer, serial, width, height):
+        nonlocal configured, desktop, wayland_buffers
+        logger.debug("Received layer configure: serial=%s width=%s height=%s", serial, width, height)
+        layer_surface.ack_configure(serial)
+        logger.debug("Acknowledged layer configure: serial=%s", serial)
+        width = width or 1920
+        height = height or 1080
+        if not wayland_buffers or width != wayland_buffers[0]["width"] or height != wayland_buffers[0]["height"]:
+            for buffer_state in wayland_buffers:
+                buffer_state["buffer"].destroy()
+                buffer_state["mapping"].close()
+            wayland_buffers = [create_buffer(width, height) for _ in range(2)]
+            desktop = MdeonCoreDesktop(width, height, present)
+        configured = True
+        desktop.redraw()
+        logger.debug("Initial desktop frame rendered after configure")
+
+    def on_closed(_layer):
+        nonlocal closed
+        closed = True
+
+    layer_surface.dispatcher["configure"] = on_configure
+    layer_surface.dispatcher["closed"] = on_closed
+    if state["seat_global"] is not None:
+        seat_id, seat_version = state["seat_global"]
+        state["seat"] = registry.bind(seat_id, WlSeat, seat_version)
+        state["seat"].dispatcher["capabilities"] = seat_capabilities
+        logger.debug("Bound Wayland seat and listening for capabilities")
+    surface.commit()
+    wl_display.flush()
+    logger.debug("Submitted initial empty surface commit; waiting for configure")
+    wl_display.roundtrip()
+    logger.debug("Initial configure roundtrip completed")
+
+    last_poll = time.monotonic()
+    while not closed:
+        if select.select([wl_display.get_fd()], [], [], 0.5)[0]:
+            wl_display.dispatch(block=True)
+        update_watchdog_heartbeat()
+        if desktop is not None and time.monotonic() - last_poll >= 0.5:
+            desktop.check_auto_refresh()
+            last_poll = time.monotonic()
+
+
+# ----------------------------------------------------------------------
+# Main Application Entrypoint
+# ----------------------------------------------------------------------
+def update_watchdog_heartbeat():
+    heartbeat_path = os.environ.get("MDEON_WATCHDOG_FILE")
+    if heartbeat_path:
+        try:
+            os.utime(heartbeat_path, None)
+        except OSError:
+            pass
+
+
+def prefers_xwayland_desktop_session():
+    session_names = (
+        os.environ.get("XDG_CURRENT_DESKTOP", ""),
+        os.environ.get("XDG_SESSION_DESKTOP", ""),
+        os.environ.get("GDMSESSION", ""),
+        os.environ.get("DESKTOP_SESSION", ""),
+        os.environ.get("MDEON_SESSION_COMPOSITOR", ""),
+    )
+    return any(
+        marker in name.casefold()
+        for name in session_names
+        for marker in ("gnome", "mutter", "kde", "plasma", "kwin")
+    )
+
+
+def run_worker_backend(backend):
+    if not acquire_instance_lock():
+        return 0
+    try:
+        if backend == "native-wayland":
+            run_wayland()
+        else:
+            if SESSION_TYPE == "wayland":
+                logger.info("Wayland session active: using Xwayland desktop surface.")
+            run_x11()
+    except KeyboardInterrupt:
+        logger.info("MDEON cleanly stopped.")
+    except Exception as exc:
+        logger.exception("Fatal error: %s", exc)
+        return 1
+    return 0
+
+
+def run_supervised_wayland():
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    with tempfile.NamedTemporaryFile(
+        prefix="mdeon-wayland-watchdog-", dir=runtime_dir, delete=False
+    ) as heartbeat_file:
+        heartbeat_path = heartbeat_file.name
+
+    worker_env = os.environ.copy()
+    worker_env["MDEON_WATCHDOG_FILE"] = heartbeat_path
+    worker = None
+    fallback_reason = None
+    started_at = time.monotonic()
+    last_heartbeat = started_at
+
+    def terminate_worker(signum, _frame):
+        if worker is not None and worker.poll() is None:
+            worker.terminate()
+            try:
+                worker.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                worker.kill()
+                worker.wait()
+        raise SystemExit(128 + signum)
+
+    previous_sigterm_handler = signal.signal(signal.SIGTERM, terminate_worker)
+    try:
+        worker = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--mdeon-worker", "native-wayland"],
+            env=worker_env,
+        )
+        startup_grace = 20.0
+        heartbeat_timeout = 6.0
+        while True:
+            return_code = worker.poll()
+            if return_code is not None:
+                if return_code == 0:
+                    return 0
+                fallback_reason = f"native Wayland worker exited with status {return_code}"
+                break
+
+            try:
+                heartbeat_mtime = os.stat(heartbeat_path).st_mtime
+                heartbeat_age = time.time() - heartbeat_mtime
+            except OSError:
+                heartbeat_age = time.monotonic() - started_at
+
+            if heartbeat_age > heartbeat_timeout and time.monotonic() - started_at > startup_grace:
+                fallback_reason = f"native Wayland worker heartbeat timed out ({heartbeat_age:.1f}s)"
+                logger.error("%s", fallback_reason)
+                worker.terminate()
+                try:
+                    worker.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    worker.kill()
+                    worker.wait()
+                break
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        if worker is not None and worker.poll() is None:
+            worker.terminate()
+            worker.wait()
+        logger.info("MDEON cleanly stopped.")
+        return 0
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
+        try:
+            os.unlink(heartbeat_path)
+        except OSError:
+            pass
+
+    if not fallback_reason:
+        return 0
+    if not os.environ.get("DISPLAY"):
+        logger.error("Cannot fall back to Xwayland: DISPLAY is not set.")
+        return 1
+
+    logger.warning("Falling back to Xwayland: %s", fallback_reason)
+    fallback_env = os.environ.copy()
+    fallback_env.pop("MDEON_WATCHDOG_FILE", None)
+    return subprocess.call(
+        [sys.executable, os.path.abspath(__file__), "--mdeon-worker", "x11"],
+        env=fallback_env,
+    )
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "--mdeon-worker":
+        sys.exit(run_worker_backend(sys.argv[2]))
+
+    backend = os.environ.get("MDEON_WAYLAND_BACKEND", "auto").lower()
+    use_native = backend in ("auto", "native", "native-wayland", "wayland")
+    if SESSION_TYPE == "wayland" and use_native:
+        if backend == "auto" and prefers_xwayland_desktop_session():
+            logger.info("GNOME/Mutter or KWin detected; using Xwayland desktop surface.")
+            sys.exit(run_worker_backend("x11"))
+        if backend == "auto" and os.environ.get("DISPLAY") and len(get_active_monitors()) > 1:
+            logger.info("Multiple Wayland outputs detected; using the Xwayland desktop canvas.")
+            sys.exit(run_worker_backend("x11"))
+        logger.info("Wayland session active: using native Wayland desktop surface.")
+        sys.exit(run_supervised_wayland())
+    sys.exit(run_worker_backend("x11"))
+

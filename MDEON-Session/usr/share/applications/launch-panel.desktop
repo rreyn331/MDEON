@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=MDEON Panel Launcher
+Comment=Launch or configure the panel or dock for the current session
+Exec=/usr/bin/launch-panel
+TryExec=/usr/bin/launch-panel
+Icon=preferences-system-windows
+Terminal=false
+Type=Application
+Categories=Settings;DesktopSettings;Utility;
+StartupNotify=true
+Keywords=MDEON;Panel;Dock;Launcher;Session;

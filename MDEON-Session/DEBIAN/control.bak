@@ -1,0 +1,70 @@
+Package: mdeon
+Version: 2026-07-19
+Section: metapackages
+Priority: optional
+Architecture: all
+Maintainer: roy <roy@example.com>
+Replaces: minimal-session-common, minimal-wayland-session, minimal-x-session
+Conflicts: minimal-session-common, minimal-wayland-session, minimal-x-session
+Provides: minimal-session-common, minimal-wayland-session, minimal-x-session
+Depends: bash,
+ python3,
+ python3-cairo,
+ python3-pywayland,
+ python3-gi,
+ gir1.2-glib-2.0,
+ xdg-utils,
+ fontconfig,
+ qt5-gtk-platformtheme,
+ qt6-gtk-platformtheme,
+ gsettings-desktop-schemas,
+ roy-debian-system-adjustments2,
+ roy-commands,
+ swaybg,
+ labwc | wayfire | sway | kwin-wayland,
+ xfwm4 | flwm | x-window-manager,
+ xdg-desktop-portal,
+ xdg-desktop-portal-gtk | xdg-desktop-portal-wlr,
+ xfce4-terminal | x-terminal-emulator,
+ wlr-randr,
+ x11-utils,
+ x11-xserver-utils,
+ xwallpaper,
+ xfce-polkit | lxpolkit | mate-polkit | policykit-1-gnome,
+ thunar | navigational-file-manager,
+ mousepad,
+ gir1.2-gtklayershell-0.1,
+ gir1.2-gtk4layershell-1.0,
+ xfce4-power-manager,
+ xfce4-notifyd,
+ wdisplays | nwg-displays,
+ xwayland,
+ libwayland-client0,
+ pamixer,
+ swaylock,
+ swayidle,
+ qt6-wayland,
+ wmctrl,
+ xsettingsd
+Recommends:
+ dbus-user-session | dbus-x11,
+ xfconf,
+ tmenu,
+ rofi,
+ thunar-custom-actions,
+ foot,
+ wlopm,
+ thunar-archive-plugin,
+ thunar-volman,
+ wl-clipboard,
+ tint2,
+ jgmenu,
+ arandr | lxrandr,
+ pasystray,
+ indicator-notifications
+Description: MDEON — Minimal Desktop Environment, Optimized for Needs
+ MDEON provides a lightweight, modular desktop environment setup
+ supporting both X11 and Wayland minimal sessions with Cairo-rendered tools.
+ .
+ This package replaces the minimal-session-common, minimal-wayland-session,
+ and minimal-x-session packages.

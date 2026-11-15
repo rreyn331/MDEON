@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+
+set -u
+
+GREP_BIN="${GREP_BIN:-$(command -v grep 2>/dev/null || echo /usr/bin/grep)}"
+SED_BIN="${SED_BIN:-$(command -v sed 2>/dev/null || echo /usr/bin/sed)}"
+
+CONFIG_CANDIDATES=(
+    "/etc/mdeon/mdeon.conf"
+    "/etc/mdeon/mdeon.conf.default"
+)
+
+for config in "${CONFIG_CANDIDATES[@]}"; do
+    if [[ -f "$config" ]]; then
+        # shellcheck disable=SC1090
+        source "$config"
+        break
+    fi
+done
+
+has_command() {
+    local cmd="${1:-}"
+    [[ -n "$cmd" ]] || return 1
+    command -v "$cmd" >/dev/null 2>&1
+}
+
+x11_session_available() {
+    if has_command "${WINDOW_MANAGER:-}"; then
+        return 0
+    fi
+
+    local candidates=(
+        xfwm4 openbox bspwm i3 fluxbox blackbox qtile awesome herbstluft jwm icewm leftwm
+        marco metacity pekwm fvwm2 dwm enlightenment sugarwm xmonad cinnamon-session
+        gnome-shell kwin_x11 mate-window-manager lxqt-panel lxqt-session
+        plasma-desktop kded5 budgie-wm
+    )
+
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if has_command "$candidate"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+wayland_session_available() {
+    if has_command "${WAYLAND_COMPOSITOR:-}"; then
+        return 0
+    fi
+
+    local candidates=(
+        labwc sway wayfire hyprland hikari weston river kwin_wayland gamescope
+        niri miracle-wm miriway cosmic-comp cage gnome-shell mutter
+    )
+
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if has_command "$candidate"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+set_entry_visibility() {
+    local file_path="$1"
+    local visible="$2"
+
+    [[ -f "$file_path" ]] || return 0
+
+    if "$GREP_BIN" -Eq '^Hidden=' "$file_path"; then
+        "$SED_BIN" -i "s|^Hidden=.*|Hidden=$visible|" "$file_path"
+    else
+        printf '\nHidden=%s\n' "$visible" >> "$file_path"
+    fi
+}
+
+X11_SESSION_ENTRY_PATH="${MDEON_X11_SESSION_ENTRY_PATH:-/usr/share/xsessions/mdeon-x11.desktop}"
+WAYLAND_SESSION_ENTRY_PATH="${MDEON_WAYLAND_SESSION_ENTRY_PATH:-/usr/share/wayland-sessions/mdeon-wayland.desktop}"
+
+x11_visible="false"
+wayland_visible="false"
+
+if x11_session_available; then
+    x11_visible="false"
+else
+    x11_visible="true"
+fi
+
+if wayland_session_available; then
+    wayland_visible="false"
+else
+    wayland_visible="true"
+fi
+
+set_entry_visibility "$X11_SESSION_ENTRY_PATH" "$x11_visible"
+set_entry_visibility "$WAYLAND_SESSION_ENTRY_PATH" "$wayland_visible"
+
+exit 0

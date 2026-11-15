@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+extension_id="mdeon-panel-window-manager@roy"
+shell_bin="$(command -v gnome-shell || true)"
+system_extension_dir="/usr/share/gnome-shell/extensions/$extension_id"
+user_extension_dir="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$extension_id"
+
+if [[ -z "$shell_bin" ]]; then
+    printf '%s\n' "mdeon-gnome-shell: gnome-shell was not found." >&2
+    exit 127
+fi
+
+if [[ -d "$user_extension_dir" && -d "$system_extension_dir" ]]; then
+    for extension_file in metadata.json extension.js; do
+        if [[ -f "$system_extension_dir/$extension_file" ]] \
+            && ! cmp -s "$system_extension_dir/$extension_file" "$user_extension_dir/$extension_file"; then
+            if ! cp "$system_extension_dir/$extension_file" "$user_extension_dir/$extension_file"; then
+                printf '%s\n' "mdeon-gnome-shell: unable to update the user extension file $extension_file." >&2
+            fi
+        fi
+    done
+fi
+
+if command -v gsettings >/dev/null 2>&1 \
+    && gsettings list-schemas 2>/dev/null | grep -qx 'org.gnome.shell'; then
+    enabled_extensions="$(gsettings get org.gnome.shell enabled-extensions 2>/dev/null || true)"
+    if [[ "$enabled_extensions" != *"'$extension_id'"* ]]; then
+        case "$enabled_extensions" in
+            '[]'|'@as []'|'')
+                enabled_extensions="['$extension_id']"
+                ;;
+            *)
+                enabled_extensions="${enabled_extensions%]}"
+                enabled_extensions+=", '$extension_id']"
+                ;;
+        esac
+
+        if ! gsettings set org.gnome.shell enabled-extensions "$enabled_extensions"; then
+            printf '%s\n' "mdeon-gnome-shell: unable to enable the MDEON panel extension." >&2
+        fi
+    fi
+fi
+
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP="MDEON:GNOME"
+export XDG_SESSION_DESKTOP=MDEON
+export DESKTOP_SESSION=mdeon
+
+exec "$shell_bin" --wayland --mode=mdeon "$@"

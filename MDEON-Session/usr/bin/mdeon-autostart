@@ -1,0 +1,1954 @@
+#!/usr/bin/env python3
+"""
+MDEON Autostart Manager (Zero-Toolkit Edition)
+- Rendering: Pure PyCairo + ctypes (Zero GTK/Qt widgets)
+- Dual backend: Direct X11 & native GTK4 Wayland window
+- Full UI Feature Parity with GTK version:
+    * Dashboard Menu (Buttons 1 - 8)
+    * Manage Entries page with interactive scrollbar and inline toggles
+    * Edit Entry Modal with text input fields and dropdown phase selector
+    * Add Entry Modal, Delete Entry Picker, and Text Viewer
+"""
+
+import os
+import re
+import sys
+import time
+import shlex
+import shutil
+import fcntl
+import ctypes
+import logging
+import tempfile
+import subprocess
+from pathlib import Path
+
+import cairo
+from mdeon_cairo_gtk import run_cairo_gtk
+from mdeon_theme import ThemedContext, prefers_light_scheme
+
+# ----------------------------------------------------------------------
+# Process Identification
+# ----------------------------------------------------------------------
+def identify_process():
+    process_name = Path(__file__).name
+    sys.argv[0] = process_name
+    if sys.platform.startswith("linux"):
+        try:
+            libc = ctypes.CDLL(None)
+            libc.prctl(15, process_name.encode("utf-8"), 0, 0, 0)
+        except (AttributeError, OSError):
+            pass
+    try:
+        import setproctitle
+        setproctitle.setproctitle(process_name)
+    except ImportError:
+        pass
+
+identify_process()
+
+# ----------------------------------------------------------------------
+# Paths, Defaults & Constants
+# ----------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.DEBUG if os.environ.get("MDEON_DEBUG") == "1" else logging.INFO,
+    format="[MDEON-AUTOSTART] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger("mdeon-autostart")
+
+SYSTEM_DIR = "/etc/xdg/autostart"
+USER_DIR = os.path.expanduser("~/.config/autostart")
+STATE_DIR = os.path.expanduser("~/.local/share/mdeon-autostart")
+LOG_FILE = os.path.join(STATE_DIR, "session.log")
+POLKIT_LOCK_FILE = os.path.join(STATE_DIR, "polkit-start.lock")
+
+USE_PARALLEL = False
+DRY_RUN = False
+
+DESKTOP = os.environ.get(
+    "XDG_CURRENT_DESKTOP",
+    os.environ.get("DESKTOP_SESSION", "generic")
+).lower()
+
+SESSION_TYPE = os.environ.get(
+    "XDG_SESSION_TYPE", "wayland" if os.environ.get("WAYLAND_DISPLAY") else "x11"
+).lower()
+ENTRY_FILE = {}
+
+# ----------------------------------------------------------------------
+# Security & Sanitization Helpers
+# ----------------------------------------------------------------------
+def ensure_directory_secure(path, private=False):
+    path = os.path.abspath(path)
+    if os.path.islink(path):
+        raise RuntimeError(f"Refusing to use symlinked directory: {path}")
+    Path(path).mkdir(parents=True, exist_ok=True)
+    if not os.path.isdir(path):
+        raise RuntimeError(f"Not a directory: {path}")
+    try:
+        st = os.stat(path)
+        if st.st_uid != os.getuid():
+            raise RuntimeError(f"Directory is not owned by current user: {path}")
+    except OSError as e:
+        raise RuntimeError(f"Could not stat directory: {path}: {e}")
+    if private:
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+
+def sanitize_desktop_value(value):
+    if value is None:
+        return ""
+    value = str(value).replace("\x00", "").replace("\r", " ").replace("\n", " ")
+    return value.strip()
+
+def validate_no_symlink(path):
+    if os.path.islink(path):
+        raise RuntimeError(f"Refusing to write symlinked file: {path}")
+
+def validate_regular_or_missing(path):
+    validate_no_symlink(path)
+    if os.path.exists(path) and not os.path.isfile(path):
+        raise RuntimeError(f"Refusing to write non-regular file: {path}")
+
+def parse_delay(value):
+    try:
+        delay = float(str(value).strip())
+    except Exception:
+        return 0.0
+    if delay < 0:
+        return 0.0
+    return min(delay, 86400.0)
+
+def format_delay(value):
+    delay = parse_delay(value)
+    text = str(delay)
+    return text[:-2] if text.endswith(".0") else text
+
+def is_inside_dir(path, directory):
+    try:
+        return os.path.commonpath([
+            os.path.abspath(path),
+            os.path.abspath(directory)
+        ]) == os.path.abspath(directory)
+    except ValueError:
+        return False
+
+def sanitize_filename(name):
+    name = sanitize_desktop_value(name)
+    name = re.sub(r"\s+", "-", name)
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", name).strip("-")
+    if not name:
+        name = "new-entry"
+    if not name.endswith(".desktop"):
+        name += ".desktop"
+    return name
+
+ensure_directory_secure(os.path.expanduser("~/.config"), private=False)
+ensure_directory_secure(USER_DIR, private=False)
+ensure_directory_secure(os.path.expanduser("~/.local/share"), private=False)
+ensure_directory_secure(STATE_DIR, private=True)
+
+# ----------------------------------------------------------------------
+# Desktop File Parser
+# ----------------------------------------------------------------------
+class DesktopFile:
+    def __init__(self, path):
+        self.path = path
+        self.lines = []
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
+                self.lines = f.readlines()
+        except OSError:
+            self.lines = []
+
+    def save(self):
+        validate_regular_or_missing(self.path)
+        directory = os.path.dirname(self.path)
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".mdeon-autostart-", suffix=".desktop.tmp", dir=directory, text=True
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.writelines(self.lines)
+            os.chmod(tmp_path, 0o644)
+            os.replace(tmp_path, self.path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def get(self, key, default=""):
+        wanted = key + "="
+        in_desktop_entry = False
+        found = False
+        for raw in self.lines:
+            line = raw.rstrip("\n")
+            if line.strip() == "[Desktop Entry]":
+                in_desktop_entry = True
+                found = True
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                in_desktop_entry = False
+                continue
+            if in_desktop_entry and line.startswith(wanted):
+                return line.split("=", 1)[1]
+
+        if not found:
+            for raw in self.lines:
+                line = raw.rstrip("\n")
+                if line.startswith(wanted):
+                    return line.split("=", 1)[1]
+        return default
+
+    def set(self, key, value):
+        value = sanitize_desktop_value(value)
+        wanted = key + "="
+        if not self.lines:
+            self.lines = ["[Desktop Entry]\n"]
+
+        d_start = None
+        d_end = len(self.lines)
+        for i, raw in enumerate(self.lines):
+            if raw.strip() == "[Desktop Entry]":
+                d_start = i
+                break
+
+        if d_start is None:
+            self.lines.insert(0, "[Desktop Entry]\n")
+            d_start = 0
+
+        for i in range(d_start + 1, len(self.lines)):
+            stripped = self.lines[i].strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                d_end = i
+                break
+
+        for i in range(d_start + 1, d_end):
+            if self.lines[i].startswith(wanted):
+                self.lines[i] = f"{key}={value}\n"
+                return
+
+        self.lines.insert(d_end, f"{key}={value}\n")
+
+    def delete(self, key):
+        wanted = key + "="
+        d_start = None
+        d_end = len(self.lines)
+        for i, raw in enumerate(self.lines):
+            if raw.strip() == "[Desktop Entry]":
+                d_start = i
+                break
+        if d_start is None:
+            return
+
+        for i in range(d_start + 1, len(self.lines)):
+            stripped = self.lines[i].strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                d_end = i
+                break
+
+        new_lines = []
+        for i, raw in enumerate(self.lines):
+            if d_start < i < d_end and raw.startswith(wanted):
+                continue
+            new_lines.append(raw)
+        self.lines = new_lines
+
+    def enabled(self):
+        if self.get("Hidden", "").lower() == "true":
+            return False
+        if self.get("X-GNOME-Autostart-enabled", "").lower() == "false":
+            return False
+        return True
+
+    def set_enabled(self, enabled):
+        if enabled:
+            self.set("Hidden", "false")
+            self.set("X-GNOME-Autostart-enabled", "true")
+        else:
+            self.set("Hidden", "true")
+            self.set("X-GNOME-Autostart-enabled", "false")
+
+def strip_quotes(value):
+    value = value.strip()
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+    return value
+
+def clean_exec(value):
+    value = value.strip()
+    value = re.sub(r"(\s|^)%[fFuUdDnNickvm](?=\s|$)", " ", value)
+    value = value.replace("%%", "%")
+    return " ".join(value.split())
+
+def ensure_user_file(filename):
+    base = os.path.basename(filename)
+    if is_inside_dir(filename, SYSTEM_DIR):
+        target = os.path.join(USER_DIR, base)
+        validate_regular_or_missing(target)
+        shutil.copy2(filename, target)
+        os.chmod(target, 0o644)
+        return target
+    if is_inside_dir(filename, USER_DIR):
+        validate_regular_or_missing(filename)
+        return filename
+    raise RuntimeError(f"Refusing to modify file outside autostart dirs: {filename}")
+
+def set_entry_enabled_by_base(base, enabled):
+    filename = ENTRY_FILE.get(base)
+    if not filename:
+        raise RuntimeError(f"Entry not found: {base}")
+    filename = ensure_user_file(filename)
+    df = DesktopFile(filename)
+    df.set_enabled(bool(enabled))
+    df.save()
+    return filename
+
+# ----------------------------------------------------------------------
+# Process Execution & Monitoring Engine
+# ----------------------------------------------------------------------
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+
+def split_exec_command(exec_line):
+    exec_line = clean_exec(strip_quotes(exec_line))
+    if not exec_line:
+        return None, {}, "empty Exec line"
+    try:
+        parts = shlex.split(exec_line, posix=True)
+    except ValueError as e:
+        return None, {}, f"could not parse Exec line: {e}"
+    if not parts:
+        return None, {}, "empty Exec command"
+
+    env_extra = {}
+    while parts and _ENV_ASSIGN_RE.match(parts[0]):
+        k, v = parts.pop(0).split("=", 1)
+        env_extra[k] = v
+
+    if parts and os.path.basename(parts[0]) == "env":
+        parts.pop(0)
+        while parts and _ENV_ASSIGN_RE.match(parts[0]):
+            k, v = parts.pop(0).split("=", 1)
+            env_extra[k] = v
+
+    if not parts:
+        return None, {}, "missing executable"
+    return parts, env_extra, ""
+
+def command_exists(command):
+    if not command:
+        return False
+    if "/" in command:
+        return os.path.exists(command) and os.access(command, os.X_OK)
+    return shutil.which(command) is not None
+
+def detached_exec(exec_line, extra_env=None):
+    args, env_extra, err = split_exec_command(exec_line)
+    if err:
+        return err
+    if not args:
+        return "missing executable"
+
+    env = os.environ.copy()
+    env.update(env_extra)
+    if extra_env:
+        env.update(extra_env)
+
+    try:
+        with open(os.devnull, "rb") as devnull_in, open(os.devnull, "wb") as devnull_out:
+            subprocess.Popen(
+                args,
+                stdin=devnull_in,
+                stdout=devnull_out,
+                stderr=devnull_out,
+                env=env,
+                start_new_session=True,
+                close_fds=True
+            )
+        return ""
+    except FileNotFoundError:
+        return f"executable not found: {args[0]}"
+    except Exception as e:
+        return str(e)
+
+def delayed_detached_exec(exec_line, delay, extra_env=None):
+    delay = parse_delay(delay)
+    try:
+        pid = os.fork()
+    except AttributeError:
+        time.sleep(delay)
+        return detached_exec(exec_line, extra_env)
+
+    if pid == 0:
+        try:
+            os.setsid()
+            time.sleep(delay)
+            detached_exec(exec_line, extra_env)
+        finally:
+            os._exit(0)
+    return ""
+
+def run_quiet(args):
+    try:
+        return subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+    except OSError:
+        return 127
+
+def is_process_running(exec_line, base):
+    if not exec_line:
+        return False
+    cmd = clean_exec(strip_quotes(exec_line))
+    args, _, _ = split_exec_command(cmd)
+    if not args:
+        return False
+    cmd_base = os.path.basename(args[0])
+
+    if command_exists("systemctl") and command_exists("systemd-escape"):
+        try:
+            esc = subprocess.check_output(
+                ["systemd-escape", base.removesuffix(".desktop")],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+            if esc:
+                for s in (f"app-{esc}@autostart.service", f"{esc}.service"):
+                    if run_quiet(["systemctl", "--user", "is-active", "--quiet", s]) == 0:
+                        return True
+        except subprocess.SubprocessError:
+            pass
+
+    if command_exists("pgrep"):
+        try:
+            out = subprocess.check_output(["pgrep", "-af", cmd_base], stderr=subprocess.DEVNULL, text=True)
+            cpid = os.getpid()
+            for line in out.splitlines():
+                if line.startswith(f"{cpid} ") or "mdeon-autostart" in line:
+                    continue
+                if cmd_base in line:
+                    return True
+        except subprocess.SubprocessError:
+            pass
+        if run_quiet(["pgrep", "-x", cmd_base]) == 0:
+            return True
+        if len(cmd_base) > 15 and run_quiet(["pgrep", "-x", cmd_base[:15]]) == 0:
+            return True
+    return False
+
+# ----------------------------------------------------------------------
+# Polkit Detection & Lock Handling
+# ----------------------------------------------------------------------
+class PolkitStartLock:
+    def __init__(self, path, timeout=10.0):
+        self.path = os.path.abspath(path)
+        self.timeout = timeout
+        self.file = None
+
+    def __enter__(self):
+        if not is_inside_dir(self.path, STATE_DIR):
+            raise RuntimeError(f"Invalid lock path outside state dir: {self.path}")
+        ensure_directory_secure(STATE_DIR, private=True)
+        validate_no_symlink(self.path)
+
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+
+        fd = os.open(self.path, flags, 0o600)
+        self.file = os.fdopen(fd, "a+", encoding="utf-8")
+        start = time.monotonic()
+        while True:
+            try:
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.file.seek(0)
+                self.file.truncate()
+                self.file.write(f"pid={os.getpid()}\ntime={time.time()}\n")
+                self.file.flush()
+                return self
+            except BlockingIOError:
+                if time.monotonic() - start >= self.timeout:
+                    raise TimeoutError(f"Timed out waiting for Polkit startup lock: {self.path}")
+                time.sleep(0.1)
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.file:
+            try:
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.file.close()
+                self.file = None
+
+def get_running_polkit_name():
+    try:
+        out = subprocess.check_output(["ps", "-xww", "-o", "pid,args="], stderr=subprocess.DEVNULL, text=True)
+    except subprocess.SubprocessError:
+        return "NONE RUNNING"
+
+    cpid = os.getpid()
+    ppid = os.getppid()
+    for line in out.splitlines():
+        if not re.search(r"polkit|policykit", line, re.IGNORECASE) or re.search(r"polkitd|grep", line, re.IGNORECASE):
+            continue
+        if "mdeon-autostart" in line:
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        try:
+            if int(parts[0]) in (cpid, ppid):
+                continue
+        except ValueError:
+            continue
+        for word in parts[1:]:
+            if re.search(r"polkit|policykit", word, re.IGNORECASE):
+                return os.path.basename(word)
+    return "NONE RUNNING"
+
+def is_any_polkit_running():
+    return get_running_polkit_name() != "NONE RUNNING"
+
+def find_any_polkit():
+    fallbacks = [
+        "/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1",
+        "/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1",
+        "/usr/libexec/polkit-xfce-authentication-agent-1",
+        "/usr/lib/xfce4/polkit/polkit-xfce-authentication-agent-1",
+        "/usr/lib/xfce-polkit/xfce-polkit",
+        "/usr/libexec/xfce-polkit",
+        "/usr/libexec/polkit-mate-authentication-agent-1",
+        "/usr/lib/mate-polkit/polkit-mate-authentication-agent-1",
+        "/usr/bin/lxqt-policykit-agent",
+        "/usr/bin/lxpolkit",
+        "/usr/libexec/polkit-kde-authentication-agent-1",
+        "/usr/lib/x86_64-linux-gnu/libexec/polkit-kde-authentication-agent-1",
+    ]
+    for b in fallbacks:
+        if os.path.exists(b) and os.access(b, os.X_OK):
+            return "BIN:" + b
+    return ""
+
+def ensure_one_polkit_started(emit):
+    try:
+        with PolkitStartLock(POLKIT_LOCK_FILE, timeout=10.0):
+            if is_any_polkit_running():
+                emit(f"[POLKIT] Already running: {get_running_polkit_name()}")
+                return
+
+            pk_res = find_any_polkit()
+            if pk_res.startswith("BIN:"):
+                pk_cmd = pk_res.removeprefix("BIN:")
+                pk_env = {"GDK_BACKEND": "x11"} if "polkit-gnome" in pk_cmd else {}
+
+                if DRY_RUN:
+                    emit(f"[POLKIT] Starting: {pk_cmd}")
+                    return
+
+                emit(f"[POLKIT] Starting Detached: {pk_cmd}")
+                err = detached_exec(pk_cmd, pk_env)
+                if err:
+                    emit(f"[POLKIT] ERROR: {err}")
+                    return
+                time.sleep(1)
+                if is_any_polkit_running():
+                    emit(f"[POLKIT] Confirmed running: {get_running_polkit_name()}")
+            else:
+                emit("[POLKIT] NO AGENT FOUND!")
+    except Exception as e:
+        emit(f"[POLKIT] LOCK ERROR: {e}")
+
+# ----------------------------------------------------------------------
+# XDG Filtering & Session Execution
+# ----------------------------------------------------------------------
+def should_skip_entry(base, filename):
+    df = DesktopFile(filename)
+    try_exec = df.get("TryExec", "").strip()
+    if try_exec and not command_exists(try_exec):
+        return True
+    only_show = df.get("OnlyShowIn", "").lower()
+    not_show = df.get("NotShowIn", "").lower()
+    desktop_parts = [x.strip().lower() for x in re.split(r"[:;]", DESKTOP) if x.strip()]
+
+    if only_show:
+        only_items = [x for x in only_show.split(";") if x]
+        if not any(de in only_items for de in desktop_parts):
+            return True
+    if not_show:
+        not_items = [x for x in not_show.split(";") if x]
+        if any(de in not_items for de in desktop_parts):
+            return True
+    if base == "xfsettingsd.desktop" and "xfce" not in DESKTOP:
+        return True
+    return False
+
+def collect_entries():
+    global ENTRY_FILE
+    ENTRY_FILE = {}
+    for directory in (SYSTEM_DIR, USER_DIR):
+        if not os.path.isdir(directory):
+            continue
+        try:
+            for name in os.listdir(directory):
+                if not name.endswith(".desktop") or re.search(r"polkit|policykit", name, re.IGNORECASE):
+                    continue
+                ENTRY_FILE[name] = os.path.join(directory, name)
+        except OSError:
+            pass
+    return ENTRY_FILE
+
+def execute_entries():
+    collect_entries()
+    dry_lines = []
+
+    def emit(line):
+        if DRY_RUN:
+            dry_lines.append(line)
+        else:
+            ensure_directory_secure(STATE_DIR, private=True)
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    if not DRY_RUN:
+        ensure_directory_secure(STATE_DIR, private=True)
+        with open(LOG_FILE, "w", encoding="utf-8") as f:
+            f.write(f"--- Session Start {time.ctime()} ---\n")
+            f.write(f"Mode: {'Parallel' if USE_PARALLEL else 'Sequential'}\n")
+
+    ensure_one_polkit_started(emit)
+
+    phase_map = {}
+    for base, filename in ENTRY_FILE.items():
+        df = DesktopFile(filename)
+        if not df.enabled() or should_skip_entry(base, filename):
+            continue
+        cmd = clean_exec(strip_quotes(df.get("Exec", "")))
+        if not cmd:
+            continue
+        phase_map[base] = {
+            "phase": df.get("X-GNOME-Autostart-Phase", "Application") or "Application",
+            "delay": df.get("X-GNOME-Autostart-Delay", "0") or "0",
+            "cmd": cmd,
+        }
+
+    phases = ["Initialization", "WindowManager", "Panel", "Desktop", "Application"]
+    for phase in phases:
+        for base in sorted(phase_map.keys()):
+            item = phase_map[base]
+            if item["phase"] != phase:
+                continue
+            delay, cmd = item["delay"], item["cmd"]
+            if DRY_RUN:
+                emit(f"[{phase}] Delay:{delay}s | {base} -> {cmd}")
+            else:
+                emit(f"[EXEC][{phase}] Starting {base}")
+                if USE_PARALLEL:
+                    err = delayed_detached_exec(cmd, delay)
+                else:
+                    time.sleep(parse_delay(delay))
+                    err = detached_exec(cmd)
+                    time.sleep(0.2)
+                if err:
+                    emit(f"[EXEC][{phase}] ERROR {base}: {err}")
+
+    return "\n".join(dry_lines) if DRY_RUN else ""
+
+# ----------------------------------------------------------------------
+# Pure Cairo Interactive Application UI
+# ----------------------------------------------------------------------
+class CairoAutostartManager:
+    PHASES = ["Initialization", "WindowManager", "Panel", "Desktop", "Application"]
+
+    def __init__(self, width, height, flush_cb):
+        self.width = width
+        self.height = height
+        self.flush_cb = flush_cb
+
+        # Page state: "MAIN" (GTK MainWindow) or "MANAGE" (GTK ManageEntriesWindow)
+        self.page = "MAIN"
+
+        # Manage view state
+        self.entries = []
+        self.selected_idx = -1
+        self.scroll_offset = 0
+        self.row_height = 36
+
+        # Scrollbar interaction state
+        self.is_dragging_scrollbar = False
+        self.drag_start_y = 0
+        self.drag_start_offset = 0
+
+        # Active Modal state
+        self.modal_type = None  # "TEXT", "EDIT", "INPUT", "SELECT"
+        self.modal_title = ""
+        self.modal_text = ""
+        self.modal_scroll = 0
+        self.modal_fields = {}
+        self.modal_focus_field = None
+        self.modal_items = []
+        self.modal_selected = 0
+        self.modal_cb = None
+
+        # Colors
+        self.c_bg = (0.13, 0.13, 0.14)
+        self.c_card = (0.18, 0.18, 0.20)
+        self.c_border = (0.28, 0.28, 0.30)
+        self.c_accent = (0.22, 0.52, 0.88)
+        self.c_accent_hover = (0.30, 0.60, 0.95)
+        self.c_text = (0.95, 0.95, 0.95)
+        self.c_dim = (0.60, 0.60, 0.62)
+        self.c_green = (0.28, 0.78, 0.40)
+        self.c_red = (0.85, 0.28, 0.28)
+
+        self._init_cairo()
+        self.refresh(redraw=False)
+
+    def _init_cairo(self):
+        self.surface = cairo.ImageSurface(cairo.FORMAT_RGB24, self.width, self.height)
+        self.ctx = ThemedContext(cairo.Context(self.surface), prefers_light_scheme())
+        self.stride = self.surface.get_stride()
+        self.data_buffer = self.surface.get_data()
+
+    def refresh(self, select_base=None, redraw=True):
+        collect_entries()
+        self.entries = []
+        new_sel = -1
+
+        for idx, base in enumerate(sorted(ENTRY_FILE.keys())):
+            fn = ENTRY_FILE[base]
+            df = DesktopFile(fn)
+            self.entries.append({
+                "base": base,
+                "file": fn,
+                "name": df.get("Name", base),
+                "exec": clean_exec(strip_quotes(df.get("Exec", ""))),
+                "enabled": df.enabled(),
+                "running": is_process_running(df.get("Exec", ""), base),
+                "is_user": is_inside_dir(fn, USER_DIR),
+                "skipped": should_skip_entry(base, fn)
+            })
+            if select_base and base == select_base:
+                new_sel = idx
+
+        if new_sel != -1:
+            self.selected_idx = new_sel
+
+        if redraw:
+            self.redraw()
+
+    # ------------------------------------------------------------------
+    # Rendering Methods
+    # ------------------------------------------------------------------
+    def redraw(self):
+        cr = self.ctx
+        cr.set_source_rgb(*self.c_bg)
+        cr.paint()
+
+        if self.page == "MAIN":
+            self._draw_main_window(cr)
+        elif self.page == "MANAGE":
+            self._draw_manage_window(cr)
+
+        if self.modal_type is not None:
+            self._draw_modal(cr)
+
+        self.surface.flush()
+        self.flush_cb()
+
+    def _draw_main_window(self, cr):
+        # Header
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(18.0)
+        cr.set_source_rgb(*self.c_text)
+        cr.move_to(36, 45)
+        cr.show_text("MDEON Autostart Manager")
+
+        mode = "PARALLEL" if USE_PARALLEL else "SEQUENTIAL"
+        desktop_name = os.environ.get("XDG_CURRENT_DESKTOP", "Generic")
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(12.0)
+        cr.set_source_rgb(*self.c_dim)
+        cr.move_to(36, 72)
+        cr.show_text(f"Desktop: {desktop_name} | Mode: {mode}")
+
+        # Separator
+        cr.set_source_rgb(*self.c_border)
+        cr.set_line_width(1.0)
+        cr.move_to(36, 88)
+        cr.line_to(self.width - 36, 88)
+        cr.stroke()
+
+        # 8 Large Dashboard Action Buttons (exact match to GTK MainWindow)
+        self.main_buttons = [
+            (1, "1  Manage Entries  (Toggle/Edit/Status)", self._nav_manage),
+            (2, f"2  Toggle Startup Mode  (Current: {mode})", self._toggle_mode),
+            (3, "3  Add New Entry", self._prompt_add_entry),
+            (4, "4  Delete User Entry", self._prompt_delete_entry),
+            (5, "5  Execute Session Now", self._action_execute_session),
+            (6, "6  Dry Run View  (Phase breakdown)", self._action_dry_run),
+            (7, "7  Show Manual  (README)", self._action_show_manual),
+            (8, "8  Exit", lambda: sys.exit(0)),
+        ]
+
+        btn_x = 36
+        btn_w = self.width - 72
+        btn_h = 40
+        start_y = 104
+        gap = 12
+
+        self.main_btn_rects = []
+        for idx, (num, label, cb) in enumerate(self.main_buttons):
+            by = start_y + idx * (btn_h + gap)
+            # Button BG
+            cr.set_source_rgb(*self.c_card)
+            cr.rectangle(btn_x, by, btn_w, btn_h)
+            cr.fill()
+            cr.set_source_rgb(*self.c_border)
+            cr.rectangle(btn_x, by, btn_w, btn_h)
+            cr.stroke()
+
+            # Button Text
+            cr.set_source_rgb(*self.c_text)
+            cr.set_font_size(13.0)
+            cr.move_to(btn_x + 16, by + 25)
+            cr.show_text(label)
+
+            self.main_btn_rects.append((btn_x, by, btn_w, btn_h, cb))
+
+    def _draw_manage_window(self, cr):
+        # Header / Status
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(15.0)
+        cr.set_source_rgb(*self.c_text)
+        cr.move_to(24, 32)
+        cr.show_text(f"Current Polkit: {get_running_polkit_name()}")
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(11.0)
+        cr.set_source_rgb(*self.c_dim)
+        cr.move_to(24, 52)
+        cr.show_text("Switch ON = enabled at login. Switch OFF = disabled. Double-click row to edit. ● running  ○ idle")
+
+        # List Area Dimensions
+        list_x = 24
+        list_y = 66
+        list_w = self.width - 48
+        list_h = self.height - 132
+
+        # Draw List Container
+        cr.set_source_rgb(*self.c_card)
+        cr.rectangle(list_x, list_y, list_w, list_h)
+        cr.fill()
+        cr.set_source_rgb(*self.c_border)
+        cr.rectangle(list_x, list_y, list_w, list_h)
+        cr.stroke()
+
+        # Rows
+        visible_rows = list_h // self.row_height
+        cr.save()
+        cr.rectangle(list_x, list_y, list_w - 18, list_h)
+        cr.clip()
+
+        self.manage_row_rects = []
+        for idx, it in enumerate(self.entries):
+            ry = list_y + (idx - self.scroll_offset) * self.row_height
+            if ry + self.row_height < list_y or ry > list_y + list_h:
+                continue
+
+            # Row background
+            if idx == self.selected_idx:
+                cr.set_source_rgba(self.c_accent[0], self.c_accent[1], self.c_accent[2], 0.35)
+                cr.rectangle(list_x + 2, ry, list_w - 22, self.row_height - 1)
+                cr.fill()
+
+            # Status Indicators: [+] / [-] and Running Dot
+            cr.set_font_size(11.5)
+            cr.set_source_rgb(*self.c_dim)
+            status_txt = "[+]" if it["enabled"] else "[-]"
+            cr.move_to(list_x + 8, ry + 22)
+            cr.show_text(status_txt)
+
+            cr.arc(list_x + 36, ry + 18, 4.0, 0, 6.28)
+            if it["running"]:
+                cr.set_source_rgb(*self.c_green)
+                cr.fill()
+            else:
+                cr.set_source_rgb(*self.c_dim)
+                cr.stroke()
+
+            # Name and Details
+            cr.set_source_rgb(*self.c_text)
+            cr.move_to(list_x + 50, ry + 22)
+            src_str = "user" if it["is_user"] else "system"
+            skip_str = " | skipped by XDG rules" if it["skipped"] else ""
+            line_str = f"{it['base']} — {it['name']} ({src_str}{skip_str})"
+            cr.show_text(line_str[:70])
+
+            # Immediate Toggle Switch
+            sw_x = list_w - 180
+            sw_y = ry + 7
+            sw_w = 46
+            sw_h = 22
+            cr.set_source_rgb(*(self.c_green if it["enabled"] else (0.28, 0.28, 0.30)))
+            cr.rectangle(sw_x, sw_y, sw_w, sw_h)
+            cr.fill()
+            cr.set_source_rgb(1, 1, 1)
+            cr.set_font_size(10.0)
+            sw_lbl = "ON" if it["enabled"] else "OFF"
+            cr.move_to(sw_x + (sw_w - cr.text_extents(sw_lbl).width) / 2, sw_y + 15)
+            cr.show_text(sw_lbl)
+
+            # Open/Edit Button
+            btn_edit_x = list_w - 120
+            btn_edit_y = ry + 6
+            btn_edit_w = 88
+            btn_edit_h = 24
+            cr.set_source_rgb(0.25, 0.25, 0.28)
+            cr.rectangle(btn_edit_x, btn_edit_y, btn_edit_w, btn_edit_h)
+            cr.fill()
+            cr.set_source_rgb(*self.c_border)
+            cr.rectangle(btn_edit_x, btn_edit_y, btn_edit_w, btn_edit_h)
+            cr.stroke()
+            cr.set_source_rgb(*self.c_text)
+            cr.set_font_size(10.5)
+            cr.move_to(btn_edit_x + 10, btn_edit_y + 16)
+            cr.show_text("Open / Edit")
+
+            self.manage_row_rects.append((
+                idx, ry, sw_x, sw_y, sw_w, sw_h,
+                btn_edit_x, btn_edit_y, btn_edit_w, btn_edit_h, it
+            ))
+
+        cr.restore()
+
+        # Vertical Scrollbar
+        sb_x = list_x + list_w - 16
+        sb_y = list_y
+        sb_w = 16
+        sb_h = list_h
+        cr.set_source_rgb(0.14, 0.14, 0.15)
+        cr.rectangle(sb_x, sb_y, sb_w, sb_h)
+        cr.fill()
+
+        total_items = max(1, len(self.entries))
+        thumb_h = max(24, int(sb_h * (visible_rows / total_items))) if total_items > visible_rows else sb_h
+        max_scroll = max(0, total_items - visible_rows)
+        thumb_y = sb_y + int((sb_h - thumb_h) * (self.scroll_offset / max_scroll)) if max_scroll > 0 else sb_y
+
+        cr.set_source_rgb(0.35, 0.35, 0.38)
+        cr.rectangle(sb_x + 2, thumb_y, sb_w - 4, thumb_h)
+        cr.fill()
+        self.scrollbar_rect = (sb_x, sb_y, sb_w, sb_h, thumb_y, thumb_h, max_scroll)
+
+        # Bottom Button Bar (matching GTK Manage Entries Window)
+        bar_y = self.height - 52
+        self.manage_buttons = [
+            (24, bar_y + 10, 140, 32, "Toggle Selected", self._action_toggle_selected),
+            (174, bar_y + 10, 160, 32, "Open / Edit Selected", self._action_edit_selected),
+            (344, bar_y + 10, 100, 32, "Refresh", lambda: self.refresh(self.selected_base())),
+            (self.width - 124, bar_y + 10, 100, 32, "Close", self._nav_main),
+        ]
+
+        self.manage_btn_rects = []
+        for bx, by, bw, bh, text, cb in self.manage_buttons:
+            cr.set_source_rgb(*self.c_card)
+            cr.rectangle(bx, by, bw, bh)
+            cr.fill()
+            cr.set_source_rgb(*self.c_border)
+            cr.rectangle(bx, by, bw, bh)
+            cr.stroke()
+            cr.set_source_rgb(*self.c_text)
+            cr.set_font_size(11.5)
+            tw = cr.text_extents(text).width
+            cr.move_to(bx + (bw - tw) / 2, by + 20)
+            cr.show_text(text)
+            self.manage_btn_rects.append((bx, by, bw, bh, cb))
+
+    # ------------------------------------------------------------------
+    # Modal Rendering
+    # ------------------------------------------------------------------
+    def _draw_modal(self, cr):
+        # Backdrop
+        cr.set_source_rgba(0, 0, 0, 0.75)
+        cr.rectangle(0, 0, self.width, self.height)
+        cr.fill()
+
+        if self.modal_type == "TEXT":
+            self._draw_modal_text(cr)
+        elif self.modal_type == "EDIT":
+            self._draw_modal_edit(cr)
+        elif self.modal_type == "INPUT":
+            self._draw_modal_input(cr)
+        elif self.modal_type == "SELECT":
+            self._draw_modal_select(cr)
+
+    def _draw_modal_text(self, cr):
+        mw, mh = min(820, self.width - 60), min(560, self.height - 60)
+        mx, my = (self.width - mw) // 2, (self.height - mh) // 2
+
+        cr.set_source_rgb(*self.c_card)
+        cr.rectangle(mx, my, mw, mh)
+        cr.fill()
+        cr.set_source_rgb(*self.c_border)
+        cr.rectangle(mx, my, mw, mh)
+        cr.stroke()
+
+        # Header
+        cr.set_source_rgb(*self.c_accent)
+        cr.rectangle(mx, my, mw, 36)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.set_font_size(13.0)
+        cr.move_to(mx + 16, my + 23)
+        cr.show_text(self.modal_title)
+
+        # Content with Scroll support
+        lines = self.modal_text.splitlines()
+        content_y = my + 48
+        content_h = mh - 100
+        vis_lines = content_h // 18
+
+        cr.save()
+        cr.rectangle(mx + 16, content_y, mw - 40, content_h)
+        cr.clip()
+        cr.select_font_face("Monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(11.0)
+        cr.set_source_rgb(*self.c_text)
+
+        for i, l in enumerate(lines):
+            ly = content_y + (i - self.modal_scroll) * 18
+            if ly + 18 < content_y or ly > content_y + content_h:
+                continue
+            cr.move_to(mx + 16, ly + 14)
+            cr.show_text(l[:110])
+        cr.restore()
+
+        # Close Button
+        btn_w, btn_h = 90, 30
+        bx = mx + mw - btn_w - 20
+        by = my + mh - btn_h - 14
+        cr.set_source_rgb(*self.c_accent)
+        cr.rectangle(bx, by, btn_w, btn_h)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.set_font_size(11.5)
+        cr.move_to(bx + 26, by + 19)
+        cr.show_text("Close")
+        self.modal_btn_rects = [(bx, by, btn_w, btn_h, lambda: self._close_modal())]
+
+    def _draw_modal_edit(self, cr):
+        mw, mh = min(780, self.width - 40), min(580, self.height - 40)
+        mx, my = (self.width - mw) // 2, (self.height - mh) // 2
+
+        cr.set_source_rgb(*self.c_card)
+        cr.rectangle(mx, my, mw, mh)
+        cr.fill()
+        cr.set_source_rgb(*self.c_border)
+        cr.rectangle(mx, my, mw, mh)
+        cr.stroke()
+
+        # Title
+        cr.set_source_rgb(*self.c_accent)
+        cr.rectangle(mx, my, mw, 36)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.set_font_size(13.0)
+        cr.move_to(mx + 16, my + 23)
+        cr.show_text(self.modal_title)
+
+        # File & Source info
+        cr.set_font_size(11.0)
+        cr.set_source_rgb(*self.c_dim)
+        cr.move_to(mx + 20, my + 56)
+        cr.show_text(f"File: {self.modal_fields.get('filename', '')}")
+        cr.move_to(mx + 20, my + 74)
+        source = "User override" if is_inside_dir(self.modal_fields.get('filename', ''), USER_DIR) else "System entry"
+        cr.show_text(f"Source: {source}")
+
+        # Immediate Enabled Switch
+        sw_x, sw_y = mx + 140, my + 88
+        enabled = self.modal_fields.get("enabled", False)
+        cr.set_source_rgb(*self.c_text)
+        cr.move_to(mx + 20, my + 104)
+        cr.show_text("Enabled at login:")
+
+        cr.set_source_rgb(*(self.c_green if enabled else (0.28, 0.28, 0.30)))
+        cr.rectangle(sw_x, sw_y, 46, 22)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        sw_lbl = "ON" if enabled else "OFF"
+        cr.move_to(sw_x + (46 - cr.text_extents(sw_lbl).width) / 2, sw_y + 15)
+        cr.show_text(sw_lbl)
+
+        cr.set_source_rgb(*self.c_dim)
+        cr.move_to(sw_x + 56, my + 104)
+        cr.show_text("This switch applies immediately.")
+
+        # Editable Text Field Grid
+        field_keys = [
+            ("name", "Name:"),
+            ("exec", "Exec:"),
+            ("tryexec", "TryExec:"),
+            ("onlyshow", "OnlyShowIn:"),
+            ("notshow", "NotShowIn:"),
+            ("delay", "Delay seconds:"),
+            ("phase", "Autostart Phase:"),
+        ]
+
+        gy = my + 128
+        self.edit_field_rects = [("enabled_switch", sw_x, sw_y, 46, 22)]
+
+        for key, lbl in field_keys:
+            cr.set_source_rgb(*self.c_text)
+            cr.set_font_size(11.5)
+            cr.move_to(mx + 20, gy + 19)
+            cr.show_text(lbl)
+
+            fx, fy, fw, fh = mx + 150, gy, mw - 180, 28
+            is_focus = (self.modal_focus_field == key)
+
+            cr.set_source_rgb(0.12, 0.12, 0.13)
+            cr.rectangle(fx, fy, fw, fh)
+            cr.fill()
+            cr.set_source_rgb(*(self.c_accent if is_focus else self.c_border))
+            cr.rectangle(fx, fy, fw, fh)
+            cr.stroke()
+
+            cr.set_source_rgb(*self.c_text)
+            val = str(self.modal_fields.get(key, ""))
+            cr.move_to(fx + 8, fy + 18)
+            cr.show_text(val + ("|" if is_focus else ""))
+
+            self.edit_field_rects.append((key, fx, fy, fw, fh))
+            gy += 36
+
+        # Phase selector dropdown buttons
+        cur_phase = self.modal_fields.get("phase", "Application")
+        px = mx + 150
+        py = gy - 36
+        for p in self.PHASES:
+            pw = cr.text_extents(p).width + 12
+            cr.set_source_rgb(*(self.c_accent if p == cur_phase else (0.22, 0.22, 0.24)))
+            cr.rectangle(px, py, pw, 26)
+            cr.fill()
+            cr.set_source_rgb(1, 1, 1)
+            cr.move_to(px + 6, py + 17)
+            cr.show_text(p)
+            self.edit_field_rects.append((f"phase:{p}", px, py, pw, 26))
+            px += pw + 6
+
+        # Note
+        cr.set_source_rgb(*self.c_dim)
+        cr.set_font_size(10.5)
+        cr.move_to(mx + 20, mh + my - 60)
+        cr.show_text("Note: Commands are launched without an implicit shell. Other fields save on Save.")
+
+        # Save and Cancel Buttons
+        bx = mx + mw - 200
+        by = my + mh - 42
+        cr.set_source_rgb(*self.c_border)
+        cr.rectangle(bx, by, 84, 28)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.move_to(bx + 20, by + 18)
+        cr.show_text("Cancel")
+
+        cr.set_source_rgb(*self.c_accent)
+        cr.rectangle(bx + 96, by, 84, 28)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.move_to(bx + 120, by + 18)
+        cr.show_text("Save")
+
+        self.modal_btn_rects = [
+            (bx, by, 84, 28, self._close_modal),
+            (bx + 96, by, 84, 28, self._save_edit_modal)
+        ]
+
+    def _draw_modal_input(self, cr):
+        mw, mh = 500, 180
+        mx, my = (self.width - mw) // 2, (self.height - mh) // 2
+
+        cr.set_source_rgb(*self.c_card)
+        cr.rectangle(mx, my, mw, mh)
+        cr.fill()
+        cr.set_source_rgb(*self.c_border)
+        cr.rectangle(mx, my, mw, mh)
+        cr.stroke()
+
+        cr.set_source_rgb(*self.c_accent)
+        cr.rectangle(mx, my, mw, 34)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.set_font_size(12.5)
+        cr.move_to(mx + 16, my + 22)
+        cr.show_text(self.modal_title)
+
+        cr.set_source_rgb(*self.c_text)
+        cr.move_to(mx + 20, my + 64)
+        cr.show_text(self.modal_text)
+
+        fx, fy, fw, fh = mx + 20, my + 78, mw - 40, 30
+        cr.set_source_rgb(0.12, 0.12, 0.14)
+        cr.rectangle(fx, fy, fw, fh)
+        cr.fill()
+        cr.set_source_rgb(*self.c_accent)
+        cr.rectangle(fx, fy, fw, fh)
+        cr.stroke()
+
+        cr.set_source_rgb(*self.c_text)
+        cr.move_to(fx + 8, fy + 20)
+        cr.show_text(self.modal_fields.get("input_val", "") + "|")
+
+        bx = mx + mw - 190
+        by = my + mh - 42
+        cr.set_source_rgb(*self.c_border)
+        cr.rectangle(bx, by, 80, 28)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.move_to(bx + 18, by + 18)
+        cr.show_text("Cancel")
+
+        cr.set_source_rgb(*self.c_accent)
+        cr.rectangle(bx + 90, by, 80, 28)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.move_to(bx + 115, by + 18)
+        cr.show_text("OK")
+
+        self.modal_btn_rects = [
+            (bx, by, 80, 28, self._close_modal),
+            (bx + 90, by, 80, 28, lambda: self._submit_input_modal(self.modal_fields.get("input_val", "")))
+        ]
+
+    def _draw_modal_select(self, cr):
+        mw, mh = 500, 280
+        mx, my = (self.width - mw) // 2, (self.height - mh) // 2
+
+        cr.set_source_rgb(*self.c_card)
+        cr.rectangle(mx, my, mw, mh)
+        cr.fill()
+        cr.set_source_rgb(*self.c_border)
+        cr.rectangle(mx, my, mw, mh)
+        cr.stroke()
+
+        cr.set_source_rgb(*self.c_accent)
+        cr.rectangle(mx, my, mw, 34)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.set_font_size(12.5)
+        cr.move_to(mx + 16, my + 22)
+        cr.show_text(self.modal_title)
+
+        cr.set_source_rgb(*self.c_text)
+        cr.move_to(mx + 20, my + 60)
+        cr.show_text(self.modal_text)
+
+        ly = my + 76
+        self.modal_select_rects = []
+        for i, item in enumerate(self.modal_items[:6]):
+            cr.set_source_rgb(*(self.c_accent if i == self.modal_selected else (0.22, 0.22, 0.25)))
+            cr.rectangle(mx + 20, ly, mw - 40, 26)
+            cr.fill()
+            cr.set_source_rgb(1, 1, 1)
+            cr.move_to(mx + 30, ly + 18)
+            cr.show_text(item)
+            self.modal_select_rects.append((i, mx + 20, ly, mw - 40, 26))
+            ly += 30
+
+        bx = mx + mw - 190
+        by = my + mh - 42
+        cr.set_source_rgb(*self.c_border)
+        cr.rectangle(bx, by, 80, 28)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.move_to(bx + 18, by + 18)
+        cr.show_text("Cancel")
+
+        cr.set_source_rgb(*self.c_accent)
+        cr.rectangle(bx + 90, by, 80, 28)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)
+        cr.move_to(bx + 115, by + 18)
+        cr.show_text("OK")
+
+        self.modal_btn_rects = [
+            (bx, by, 80, 28, self._close_modal),
+            (bx + 90, by, 80, 28, lambda: self._submit_select_modal())
+        ]
+
+    # ------------------------------------------------------------------
+    # User Input & Event Dispatchers
+    # ------------------------------------------------------------------
+    def handle_click(self, x, y, button):
+        # 1. Modals Capture
+        if self.modal_type is not None:
+            # Check button actions
+            for bx, by, bw, bh, cb in getattr(self, "modal_btn_rects", []):
+                if bx <= x <= bx + bw and by <= y <= by + bh:
+                    cb()
+                    return
+
+            if self.modal_type == "EDIT":
+                for item in getattr(self, "edit_field_rects", []):
+                    key, fx, fy, fw, fh = item
+                    if fx <= x <= fx + fw and fy <= y <= fy + fh:
+                        if key == "enabled_switch":
+                            curr = self.modal_fields.get("enabled", False)
+                            new_val = not curr
+                            self.modal_fields["enabled"] = new_val
+                            try:
+                                set_file_enabled(self.modal_fields["filename"], new_val)
+                            except Exception as e:
+                                logger.error("Failed to toggle immediate switch: %s", e)
+                            self.redraw()
+                            return
+                        elif key.startswith("phase:"):
+                            self.modal_fields["phase"] = key.split(":", 1)[1]
+                            self.redraw()
+                            return
+                        else:
+                            self.modal_focus_field = key
+                            self.redraw()
+                            return
+
+            elif self.modal_type == "SELECT":
+                for i, sx, sy, sw, sh in getattr(self, "modal_select_rects", []):
+                    if sx <= x <= sx + sw and sy <= y <= sy + sh:
+                        self.modal_selected = i
+                        self.redraw()
+                        return
+            return
+
+        # 2. Main Page Navigation
+        if self.page == "MAIN":
+            for bx, by, bw, bh, cb in getattr(self, "main_btn_rects", []):
+                if bx <= x <= bx + bw and by <= y <= by + bh:
+                    cb()
+                    return
+            return
+
+        # 3. Manage Page Actions
+        if self.page == "MANAGE":
+            # Manage Bottom buttons
+            for bx, by, bw, bh, cb in getattr(self, "manage_btn_rects", []):
+                if bx <= x <= bx + bw and by <= y <= by + bh:
+                    cb()
+                    return
+
+            # Scrollbar drag
+            sb_x, sb_y, sb_w, sb_h, thumb_y, thumb_h, max_scroll = getattr(self, "scrollbar_rect", (0, 0, 0, 0, 0, 0, 0))
+            if sb_x <= x <= sb_x + sb_w and sb_y <= y <= sb_y + sb_h:
+                if thumb_y <= y <= thumb_y + thumb_h:
+                    self.is_dragging_scrollbar = True
+                    self.drag_start_y = y
+                    self.drag_start_offset = self.scroll_offset
+                else:
+                    ratio = (y - sb_y) / sb_h
+                    self.scroll_offset = max(0, min(max_scroll, int(ratio * max_scroll)))
+                    self.redraw()
+                return
+
+            # Manage Entry Rows
+            for idx, ry, sw_x, sw_y, sw_w, sw_h, be_x, be_y, be_w, be_h, it in getattr(self, "manage_row_rects", []):
+                # Row selection
+                if 24 <= x <= self.width - 48 and ry <= y <= ry + self.row_height:
+                    self.selected_idx = idx
+                    # Direct Switch Click
+                    if sw_x <= x <= sw_x + sw_w and sw_y <= y <= sw_y + sw_h:
+                        self._toggle_entry(it["base"])
+                        return
+                    # Open / Edit Click
+                    if be_x <= x <= be_x + be_w and be_y <= y <= be_y + be_h:
+                        self._open_edit_entry(it["base"])
+                        return
+                    self.redraw()
+                    return
+
+    def handle_motion(self, x, y):
+        if self.is_dragging_scrollbar and self.page == "MANAGE":
+            sb_x, sb_y, sb_w, sb_h, _, thumb_h, max_scroll = getattr(self, "scrollbar_rect", (0, 0, 0, 0, 0, 0, 0))
+            dy = y - self.drag_start_y
+            track_avail = max(1, sb_h - thumb_h)
+            scroll_delta = int((dy / track_avail) * max_scroll)
+            self.scroll_offset = max(0, min(max_scroll, self.drag_start_offset + scroll_delta))
+            self.redraw()
+
+    def handle_button_release(self, button):
+        if button == 1:
+            self.is_dragging_scrollbar = False
+
+    def handle_scroll(self, dy):
+        if self.modal_type == "TEXT":
+            self.modal_scroll = max(0, self.modal_scroll + dy * 2)
+            self.redraw()
+            return
+        if self.page == "MANAGE":
+            self.scroll_offset = max(0, min(len(self.entries) - 3, self.scroll_offset + dy))
+            self.redraw()
+
+    def handle_key(self, keysym, string_val=""):
+        # Modal Typing Handling
+        if self.modal_type == "INPUT":
+            val = self.modal_fields.get("input_val", "")
+            if keysym in (0xff08, 0xffff):  # Backspace / Delete
+                self.modal_fields["input_val"] = val[:-1]
+                self.redraw()
+            elif keysym in (0xff0d, 0xff8d):  # Enter
+                self._submit_input_modal(val)
+            elif keysym == 0xff1b:  # Escape
+                self._close_modal()
+            elif string_val and string_val.isprintable():
+                self.modal_fields["input_val"] = val + string_val
+                self.redraw()
+            elif 32 <= keysym <= 126:
+                self.modal_fields["input_val"] = val + chr(keysym)
+                self.redraw()
+            return
+
+        if self.modal_type == "EDIT" and self.modal_focus_field:
+            val = str(self.modal_fields.get(self.modal_focus_field, ""))
+            if keysym in (0xff08, 0xffff):  # Backspace
+                self.modal_fields[self.modal_focus_field] = val[:-1]
+                self.redraw()
+            elif keysym in (0xff0d, 0xff8d):  # Enter
+                self.modal_focus_field = None
+                self.redraw()
+            elif keysym == 0xff1b:
+                self.modal_focus_field = None
+                self.redraw()
+            elif string_val and string_val.isprintable():
+                self.modal_fields[self.modal_focus_field] = val + string_val
+                self.redraw()
+            elif 32 <= keysym <= 126:
+                self.modal_fields[self.modal_focus_field] = val + chr(keysym)
+                self.redraw()
+            return
+
+        # General Keys
+        if keysym == 0xff1b:  # Escape
+            if self.modal_type:
+                self._close_modal()
+            elif self.page == "MANAGE":
+                self._nav_main()
+            return
+
+        if self.page == "MANAGE":
+            if keysym in (0xff54, 0x6a):  # Down
+                if self.selected_idx < len(self.entries) - 1:
+                    self.selected_idx += 1
+                    if self.selected_idx - self.scroll_offset > (self.height - 180) // self.row_height:
+                        self.scroll_offset += 1
+                    self.redraw()
+            elif keysym in (0xff52, 0x6b):  # Up
+                if self.selected_idx > 0:
+                    self.selected_idx -= 1
+                    if self.selected_idx < self.scroll_offset:
+                        self.scroll_offset = self.selected_idx
+                    self.redraw()
+            elif keysym == 0x20:  # Space
+                self._action_toggle_selected()
+            elif keysym in (0xff0d, 0xff8d):  # Enter
+                self._action_edit_selected()
+
+    # ------------------------------------------------------------------
+    # Action Handlers Matching GTK Specification
+    # ------------------------------------------------------------------
+    def selected_base(self):
+        if 0 <= self.selected_idx < len(self.entries):
+            return self.entries[self.selected_idx]["base"]
+        return None
+
+    def _nav_manage(self):
+        self.page = "MANAGE"
+        self.redraw()
+        self.refresh()
+
+    def _nav_main(self):
+        self.page = "MAIN"
+        self.redraw()
+
+    def _toggle_mode(self):
+        global USE_PARALLEL
+        USE_PARALLEL = not USE_PARALLEL
+        self.redraw()
+
+    def _action_toggle_selected(self):
+        base = self.selected_base()
+        if not base:
+            self._show_info("No Selection", "Select an entry first.")
+            return
+        self._toggle_entry(base)
+
+    def _toggle_entry(self, base):
+        for it in self.entries:
+            if it["base"] == base:
+                try:
+                    set_entry_enabled_by_base(base, not it["enabled"])
+                except Exception as e:
+                    logger.error("Failed to toggle entry: %s", e)
+                self.refresh(select_base=base)
+                break
+
+    def _action_edit_selected(self):
+        base = self.selected_base()
+        if not base:
+            self._show_info("No Selection", "Select an entry first.")
+            return
+        self._open_edit_entry(base)
+
+    def _open_edit_entry(self, base):
+        filename = ENTRY_FILE.get(base)
+        if not filename:
+            self._show_info("Missing Entry", f"Entry no longer exists:\n\n{base}")
+            return
+        try:
+            filename = ensure_user_file(filename)
+        except Exception as e:
+            self._show_info("Error", f"Could not create user override for:\n\n{base}\n\n{e}")
+            return
+
+        df = DesktopFile(filename)
+        self.modal_type = "EDIT"
+        self.modal_title = f"View / Edit Entry - {base}"
+        self.modal_fields = {
+            "base": base,
+            "filename": filename,
+            "enabled": df.enabled(),
+            "name": df.get("Name", ""),
+            "exec": strip_quotes(df.get("Exec", "")),
+            "tryexec": df.get("TryExec", ""),
+            "onlyshow": df.get("OnlyShowIn", ""),
+            "notshow": df.get("NotShowIn", ""),
+            "delay": df.get("X-GNOME-Autostart-Delay", "0") or "0",
+            "phase": df.get("X-GNOME-Autostart-Phase", "Application") or "Application",
+        }
+        self.modal_focus_field = None
+        self.redraw()
+
+    def _save_edit_modal(self):
+        fn = self.modal_fields["filename"]
+        df = DesktopFile(fn)
+        name_val = sanitize_desktop_value(self.modal_fields["name"])
+        exec_val = sanitize_desktop_value(self.modal_fields["exec"])
+
+        if not name_val:
+            self._show_info("Invalid Entry", "Name cannot be empty.")
+            return
+        if not exec_val:
+            self._show_info("Invalid Entry", "Exec cannot be empty.")
+            return
+
+        args, _, err = split_exec_command(exec_val)
+        if err or not args:
+            self._show_info("Invalid Exec", f"Exec line is invalid:\n\n{err}")
+            return
+
+        df.set_enabled(self.modal_fields["enabled"])
+        df.set("Name", name_val)
+        df.set("Exec", exec_val)
+
+        for k, desktop_key in [
+            ("tryexec", "TryExec"), ("onlyshow", "OnlyShowIn"), ("notshow", "NotShowIn")
+        ]:
+            val = sanitize_desktop_value(self.modal_fields.get(k, ""))
+            if val:
+                df.set(desktop_key, val)
+            else:
+                df.delete(desktop_key)
+
+        df.set("X-GNOME-Autostart-Phase", self.modal_fields.get("phase", "Application"))
+        df.set("X-GNOME-Autostart-Delay", format_delay(self.modal_fields.get("delay", "0")))
+
+        try:
+            df.save()
+        except Exception as e:
+            self._show_info("Save Failed", str(e))
+            return
+
+        self._close_modal()
+        self.refresh(select_base=self.modal_fields["base"])
+
+    def _prompt_add_entry(self):
+        def on_name_entered(name):
+            if not name:
+                return
+            def on_cmd_entered(cmd):
+                if not cmd:
+                    return
+                parsed, _, err = split_exec_command(cmd)
+                if err or not parsed:
+                    self._show_info("Invalid Command", f"Command is invalid:\n\n{err}")
+                    return
+
+                fn = os.path.join(USER_DIR, sanitize_filename(name))
+                df = DesktopFile(fn)
+                df.lines = [
+                    "[Desktop Entry]\n",
+                    "Type=Application\n",
+                    f"Name={name}\n",
+                    f"Exec={cmd}\n",
+                    "Hidden=false\n",
+                    "X-GNOME-Autostart-enabled=true\n",
+                    "X-GNOME-Autostart-Phase=Application\n",
+                    "X-GNOME-Autostart-Delay=0\n",
+                ]
+                try:
+                    df.save()
+                    self._show_info("Entry Added", f"Created:\n{fn}")
+                except Exception as e:
+                    self._show_info("Create Failed", str(e))
+
+            self._prompt_input("Add New Entry", "Command:", on_cmd_entered)
+
+        self._prompt_input("Add New Entry", "Name:", on_name_entered)
+
+    def _prompt_delete_entry(self):
+        collect_entries()
+        user_entries = sorted(
+            b for b, fn in ENTRY_FILE.items() if is_inside_dir(fn, USER_DIR)
+        )
+        if not user_entries:
+            self._show_info("Delete User Entry", "No user entries exist.")
+            return
+
+        def on_selected(entry_name):
+            fn = os.path.join(USER_DIR, os.path.basename(entry_name))
+            try:
+                os.remove(fn)
+                self._show_info("Deleted", f"Deleted:\n{fn}")
+                self.refresh()
+            except OSError as e:
+                self._show_info("Error", f"Could not delete:\n{fn}\n\n{e}")
+
+        self.modal_type = "SELECT"
+        self.modal_title = "Delete User Entry"
+        self.modal_text = "Choose a user autostart entry to delete:"
+        self.modal_items = user_entries
+        self.modal_selected = 0
+        self.modal_cb = on_selected
+        self.redraw()
+
+    def _action_execute_session(self):
+        execute_entries()
+        mode = "PARALLEL" if USE_PARALLEL else "SEQUENTIAL"
+        self._show_info("Session Started", f"Session started in {mode} mode.\n\nLog:\n{LOG_FILE}")
+
+    def _action_dry_run(self):
+        global DRY_RUN
+        DRY_RUN = True
+        output = execute_entries()
+        DRY_RUN = False
+        if not output.strip():
+            output = "No programs would be started."
+        self._show_info("Dry Run View (Phase breakdown)", output)
+
+    def _action_show_manual(self):
+        help_text = """MDEON AUTOSTART MANAGER - HELP
+==============================
+
+COMMAND LINE OPTIONS:
+  --session            Start enabled apps sequentially
+  --session-parallel   Start enabled apps in parallel
+  --dry-run            Show what would start without launching anything
+  --list               List entries
+  --enable FILE        Enable an entry
+  --disable FILE       Disable an entry
+  --delete FILE        Delete a user entry
+
+SYMBOLS:
+  [+]  Enabled at login
+  [-]  Disabled at login
+  ●    Currently running
+  ○    Currently idle
+
+POLKIT PROTECTION:
+  Before normal applications are started, this tool ensures that one Polkit
+  authentication agent is running.
+  It uses a lock file:
+    ~/.local/share/mdeon-autostart/polkit-start.lock
+
+MANAGE ENTRIES PAGE:
+  Switch ON = enabled at login. Switch OFF = disabled.
+  Open / Edit:
+    The "Enabled at login" switch applies immediately.
+    Other fields are saved only when Save is pressed.
+
+STARTUP PHASES:
+  Entries launch in this order:
+    Initialization -> WindowManager -> Panel -> Desktop -> Application
+"""
+        self._show_info("Manual / Help", help_text)
+
+    def _prompt_input(self, title, label, cb):
+        self.modal_type = "INPUT"
+        self.modal_title = title
+        self.modal_text = label
+        self.modal_fields = {"input_val": ""}
+        self.modal_cb = cb
+        self.redraw()
+
+    def _submit_input_modal(self, val):
+        cb = self.modal_cb
+        self._close_modal()
+        if cb:
+            cb(val)
+
+    def _submit_select_modal(self):
+        if 0 <= self.modal_selected < len(self.modal_items):
+            item = self.modal_items[self.modal_selected]
+            cb = self.modal_cb
+            self._close_modal()
+            if cb:
+                cb(item)
+
+    def _show_info(self, title, text):
+        self.modal_type = "TEXT"
+        self.modal_title = title
+        self.modal_text = text
+        self.modal_scroll = 0
+        self.redraw()
+
+    def _close_modal(self):
+        self.modal_type = None
+        self.modal_focus_field = None
+        self.redraw()
+
+# ----------------------------------------------------------------------
+# Direct X11 Backend
+# ----------------------------------------------------------------------
+def run_x11():
+    try:
+        x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+    except OSError:
+        raise RuntimeError("libX11.so.6 is required for X11 mode.")
+
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XDefaultScreen.restype = ctypes.c_int
+    x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+    x11.XRootWindow.restype = ctypes.c_ulong
+    x11.XRootWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDefaultVisual.restype = ctypes.c_void_p
+    x11.XDefaultVisual.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDefaultDepth.restype = ctypes.c_int
+    x11.XDefaultDepth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XCreateSimpleWindow.restype = ctypes.c_ulong
+    x11.XCreateSimpleWindow.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_ulong
+    ]
+    x11.XCreateGC.restype = ctypes.c_void_p
+    x11.XCreateGC.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+    x11.XCreateImage.restype = ctypes.c_void_p
+    x11.XCreateImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_int,
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int
+    ]
+    x11.XPutImage.restype = ctypes.c_int
+    x11.XPutImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint
+    ]
+    x11.XSelectInput.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long]
+    x11.XMapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XPending.restype = ctypes.c_int
+    x11.XPending.argtypes = [ctypes.c_void_p]
+    x11.XKeycodeToKeysym.restype = ctypes.c_ulong
+    x11.XKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int]
+    x11.XStoreName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_char_p]
+
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise RuntimeError("Cannot open X11 display.")
+
+    screen = x11.XDefaultScreen(display)
+    root = x11.XRootWindow(display, screen)
+    width, height = 860, 580
+
+    win = x11.XCreateSimpleWindow(display, root, 100, 100, width, height, 0, 0, 0x1e1e1e)
+    x11.XStoreName(display, win, b"MDEON Autostart Manager")
+
+    # Select KeyPress (1<<0), ButtonPress (1<<2), ButtonRelease (1<<3), PointerMotion (1<<6), Exposure (1<<15)
+    x11.XSelectInput(display, win, (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 15))
+    x11.XMapWindow(display, win)
+    x11.XFlush(display)
+
+    gc = x11.XCreateGC(display, win, 0, None)
+    visual = x11.XDefaultVisual(display, screen)
+    depth = x11.XDefaultDepth(display, screen)
+
+    manager = None
+    def flush():
+        if manager is not None and getattr(manager, "ximage", None):
+            x11.XPutImage(display, win, gc, manager.ximage, 0, 0, 0, 0, width, height)
+            x11.XFlush(display)
+
+    manager = CairoAutostartManager(width, height, flush)
+    c_data = (ctypes.c_char * (manager.stride * height)).from_buffer(manager.data_buffer)
+    manager.ximage = x11.XCreateImage(
+        display, visual, depth, 2, 0, ctypes.addressof(c_data), width, height, 32, manager.stride
+    )
+    manager.redraw()
+
+    class XEvent(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("pad", ctypes.c_byte * 192)]
+
+    class XButtonEvent(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+            ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+            ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+            ("state", ctypes.c_uint), ("button", ctypes.c_uint), ("same_screen", ctypes.c_int),
+        ]
+
+    class XMotionEvent(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+            ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+            ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+            ("state", ctypes.c_uint), ("is_hint", ctypes.c_char), ("same_screen", ctypes.c_int),
+        ]
+
+    class XKeyEvent(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+            ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+            ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+            ("state", ctypes.c_uint), ("keycode", ctypes.c_uint), ("same_screen", ctypes.c_int),
+        ]
+
+    ev = XEvent()
+    while True:
+        while x11.XPending(display):
+            x11.XNextEvent(display, ctypes.byref(ev))
+            if ev.type == 12:  # Expose
+                manager.redraw()
+            elif ev.type == 4:  # ButtonPress
+                bev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XButtonEvent)).contents
+                if bev.button == 4:
+                    manager.handle_scroll(-1)
+                elif bev.button == 5:
+                    manager.handle_scroll(1)
+                else:
+                    manager.handle_click(bev.x, bev.y, bev.button)
+            elif ev.type == 5:  # ButtonRelease
+                manager.is_dragging_scrollbar = False
+            elif ev.type == 6:  # MotionNotify
+                mev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XMotionEvent)).contents
+                manager.handle_motion(mev.x, mev.y)
+            elif ev.type == 2:  # KeyPress
+                kev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XKeyEvent)).contents
+                keysym = x11.XKeycodeToKeysym(display, kev.keycode, 0)
+                manager.handle_key(keysym)
+        time.sleep(0.02)
+
+# ----------------------------------------------------------------------
+# Wayland Window Backend
+# ----------------------------------------------------------------------
+def run_wayland():
+    run_cairo_gtk(CairoAutostartManager, "MDEON Autostart Manager", 860, 580, 600, 400)
+
+# ----------------------------------------------------------------------
+# CLI Interface & Entrypoint
+# ----------------------------------------------------------------------
+def print_cli_help():
+    print("""mdeon-autostart - MDEON Autostart Manager (Zero-Toolkit)
+
+Usage:
+  mdeon-autostart                      Open Cairo UI (Auto X11 / Wayland)
+  mdeon-autostart --session            Start enabled autostart entries sequentially
+  mdeon-autostart --session-parallel   Start enabled autostart entries in parallel
+  mdeon-autostart --dry-run            Print execution breakdown without launching
+  mdeon-autostart --list               List known autostart entries
+  mdeon-autostart --enable FILE.desktop Enable an autostart entry
+  mdeon-autostart --disable FILE.desktop Disable an autostart entry
+  mdeon-autostart --delete FILE.desktop Delete a user autostart entry
+  mdeon-autostart --help               Show this help
+""")
+
+def cli_list():
+    collect_entries()
+    for base in sorted(ENTRY_FILE.keys()):
+        fn = ENTRY_FILE[base]
+        df = DesktopFile(fn)
+        st = "enabled" if df.enabled() else "disabled"
+        rn = "running" if is_process_running(df.get("Exec", ""), base) else "idle"
+        src = "user" if is_inside_dir(fn, USER_DIR) else "system"
+        print(f"{base}\t{st}\t{rn}\t{src}\t{df.get('Name', base)}\t{clean_exec(strip_quotes(df.get('Exec', '')))}")
+
+def main():
+    global DRY_RUN, USE_PARALLEL
+    args = sys.argv[1:]
+    if args:
+        if args[0] in ("-h", "--help"):
+            print_cli_help()
+            return 0
+        if args[0] == "--session":
+            USE_PARALLEL = False
+            execute_entries()
+            return 0
+        if args[0] == "--session-parallel":
+            USE_PARALLEL = True
+            execute_entries()
+            return 0
+        if args[0] == "--dry-run":
+            DRY_RUN = True
+            print(execute_entries())
+            return 0
+        if args[0] == "--list":
+            cli_list()
+            return 0
+        if args[0] == "--enable" and len(args) > 1:
+            collect_entries()
+            set_entry_enabled_by_base(args[1], True)
+            print(f"Enabled: {args[1]}")
+            return 0
+        if args[0] == "--disable" and len(args) > 1:
+            collect_entries()
+            set_entry_enabled_by_base(args[1], False)
+            print(f"Disabled: {args[1]}")
+            return 0
+        if args[0] == "--delete" and len(args) > 1:
+            target = os.path.join(USER_DIR, os.path.basename(args[1]))
+            if os.path.isfile(target):
+                os.remove(target)
+                print(f"Deleted: {target}")
+            else:
+                print(f"Entry not found or not in user directory: {args[1]}", file=sys.stderr)
+                return 1
+            return 0
+
+    # UI Launch Dispatcher
+    if SESSION_TYPE == "wayland" and os.environ.get("WAYLAND_DISPLAY"):
+        try:
+            run_wayland()
+            return 0
+        except Exception as e:
+            if not os.environ.get("DISPLAY"):
+                logger.error("Unable to start Autostart Manager in Wayland: %s", e)
+                return 1
+            logger.warning("Wayland window startup failed (%s); falling back to X11.", e)
+
+    if not os.environ.get("DISPLAY"):
+        logger.error("No graphical display available (Wayland or X11).")
+        return 1
+    try:
+        run_x11()
+        return 0
+    except Exception as e:
+        logger.error("Unable to start Autostart Manager: %s", e)
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=MDEON Settings
+Comment=Configure MDEON desktop session settings
+Exec=/usr/bin/mdeon-settings
+TryExec=/usr/bin/mdeon-settings
+Icon=preferences-system
+Terminal=false
+Type=Application
+Categories=Settings;DesktopSettings;GTK;
+StartupNotify=true
+StartupWMClass=mdeon-settings
+Keywords=MDEON;Settings;Desktop;X11;Wayland;Autostart;

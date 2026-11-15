@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=MDEON Display Settings
+Comment=Configure display layouts, scaling, and monitor settings
+Exec=/usr/bin/mdeon-display-settings
+TryExec=/usr/bin/mdeon-display-settings
+Icon=preferences-desktop-display
+Terminal=false
+Type=Application
+Categories=Settings;DesktopSettings;GTK;
+StartupNotify=true
+Keywords=MDEON;Display;Monitor;Resolution;Scale;X11;Wayland;

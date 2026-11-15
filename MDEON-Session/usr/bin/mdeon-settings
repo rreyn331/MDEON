@@ -1,0 +1,1940 @@
+#!/usr/bin/env python3
+"""
+MDEON Ultra-Lightweight Desktop Settings (Zero-Toolkit Edition)
+- Rendering: Pure PyCairo + Native X11 / Wayland backends (Zero GTK/Qt GUI widgets)
+- Replicates all GTK4 mdeon-settings tabs: Common, X11, Wayland, Autostart, and Tools
+- Includes Live Wallpaper Thumbnail Preview and Cairo Color Picker Dialog
+"""
+
+import os
+import io
+import re
+import sys
+import time
+import math
+import shutil
+import signal
+import ctypes
+import fcntl
+import logging
+import subprocess
+import shlex
+from pathlib import Path
+
+import cairo
+from mdeon_cairo_gtk import run_cairo_gtk
+from mdeon_theme import ThemedContext, prefers_light_scheme
+
+try:
+    from PIL import Image
+    HAVE_PIL = True
+except ImportError:
+    HAVE_PIL = False
+
+# ----------------------------------------------------------------------
+# Process Identification
+# ----------------------------------------------------------------------
+def identify_process(name="mdeon-settings"):
+    name = Path(__file__).name
+    sys.argv[0] = name
+    if sys.platform.startswith("linux"):
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            libc.prctl(15, name.encode("utf-8"), 0, 0, 0)
+        except Exception:
+            pass
+    try:
+        import setproctitle
+        setproctitle.setproctitle(name)
+    except ImportError:
+        pass
+
+identify_process()
+
+# ----------------------------------------------------------------------
+# Paths and Defaults
+# ----------------------------------------------------------------------
+CONF = Path.home() / ".config/mdeon/mdeon.conf"
+DFLT = Path("/etc/mdeon/mdeon.conf.default")
+USER_AUTO = Path.home() / ".config/autostart"
+SYS_AUTO = Path("/etc/xdg/autostart")
+USER_AUTO.mkdir(parents=True, exist_ok=True)
+
+SESSION_TYPE = os.environ.get(
+    "XDG_SESSION_TYPE", "wayland" if os.environ.get("WAYLAND_DISPLAY") else "x11"
+).lower()
+
+logging.basicConfig(
+    level=logging.DEBUG if os.environ.get("MDEON_DEBUG") == "1" else logging.INFO,
+    format="[MDEON-SETTINGS] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger("mdeon-settings")
+
+# ----------------------------------------------------------------------
+# Native X11 CTypes Bindings
+# ----------------------------------------------------------------------
+try:
+    x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XDefaultScreen.restype = ctypes.c_int
+    x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+    x11.XRootWindow.restype = ctypes.c_ulong
+    x11.XRootWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDefaultVisual.restype = ctypes.c_void_p
+    x11.XDefaultVisual.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDefaultDepth.restype = ctypes.c_int
+    x11.XDefaultDepth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XCreateSimpleWindow.restype = ctypes.c_ulong
+    x11.XCreateSimpleWindow.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_ulong
+    ]
+    x11.XCreateGC.restype = ctypes.c_void_p
+    x11.XCreateGC.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+    x11.XCreateImage.restype = ctypes.c_void_p
+    x11.XCreateImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_int,
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int
+    ]
+    x11.XPutImage.restype = ctypes.c_int
+    x11.XPutImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint
+    ]
+    x11.XSelectInput.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long]
+    x11.XMapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XDestroyWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XPending.restype = ctypes.c_int
+    x11.XPending.argtypes = [ctypes.c_void_p]
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XChangeProperty.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int
+    ]
+    x11.XKeycodeToKeysym.restype = ctypes.c_ulong
+    x11.XKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int]
+    x11.XStoreName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_char_p]
+    x11.XLookupString.restype = ctypes.c_int
+    x11.XLookupString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
+    ]
+
+    class XEvent(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("pad", ctypes.c_long * 24)]
+
+    class XButtonEvent(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+            ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+            ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+            ("state", ctypes.c_uint), ("button", ctypes.c_uint), ("same_screen", ctypes.c_int)
+        ]
+
+    class XMotionEvent(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+            ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+            ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+            ("state", ctypes.c_uint), ("is_hint", ctypes.c_char), ("same_screen", ctypes.c_int)
+        ]
+
+    class XKeyEvent(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+            ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+            ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+            ("state", ctypes.c_uint), ("keycode", ctypes.c_uint), ("same_screen", ctypes.c_int)
+        ]
+
+    class XClientMessageEvent(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int),
+            ("serial", ctypes.c_ulong),
+            ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p),
+            ("window", ctypes.c_ulong),
+            ("message_type", ctypes.c_ulong),
+            ("format", ctypes.c_int),
+            ("data", ctypes.c_long * 5)
+        ]
+
+    class XConfigureEvent(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p), ("event", ctypes.c_ulong), ("window", ctypes.c_ulong),
+            ("x", ctypes.c_int), ("y", ctypes.c_int), ("width", ctypes.c_int),
+            ("height", ctypes.c_int), ("border_width", ctypes.c_int),
+            ("above", ctypes.c_ulong), ("override_redirect", ctypes.c_int)
+        ]
+
+    class XImageFuncs(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_void_p) for name in (
+            "create_image", "destroy_image", "get_pixel", "put_pixel", "sub_image", "add_pixel"
+        )]
+
+    class XImageData(ctypes.Structure):
+        _fields_ = [
+            ("width", ctypes.c_int), ("height", ctypes.c_int),
+            ("xoffset", ctypes.c_int), ("format", ctypes.c_int),
+            ("data", ctypes.c_void_p), ("byte_order", ctypes.c_int),
+            ("bitmap_unit", ctypes.c_int), ("bitmap_bit_order", ctypes.c_int),
+            ("bitmap_pad", ctypes.c_int), ("depth", ctypes.c_int),
+            ("bytes_per_line", ctypes.c_int), ("bits_per_pixel", ctypes.c_int),
+            ("red_mask", ctypes.c_ulong), ("green_mask", ctypes.c_ulong),
+            ("blue_mask", ctypes.c_ulong), ("obdata", ctypes.c_void_p),
+            ("funcs", XImageFuncs)
+        ]
+
+    x11.XResizeWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_uint, ctypes.c_uint]
+    x11.XDisplayWidth.restype = ctypes.c_int
+    x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDisplayHeight.restype = ctypes.c_int
+    x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+    HAVE_X11 = True
+except Exception:
+    HAVE_X11 = False
+
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
+def run(cmd):
+    try:
+        subprocess.Popen(cmd, shell=True, start_new_session=True)
+    except Exception as e:
+        logger.error(f"Failed to execute command '{cmd}': {e}")
+
+def has(cmd):
+    return shutil.which(cmd) is not None
+
+MDEON_SESSION_COMPONENTS = {"mdeon-desktop", "mdeon-panel"}
+
+def available(candidates):
+    out = []
+    for item in candidates:
+        if item == "none":
+            out.append(item)
+        elif item in MDEON_SESSION_COMPONENTS or has(item):
+            out.append(item)
+        elif "/" in item and Path(item).exists():
+            out.append(item)
+    return out
+
+def quote_value(value):
+    value = str(value)
+    value = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{value}"'
+
+def hex_to_rgb(hex_str, fallback=(0.18, 0.18, 0.18)):
+    s = str(hex_str).strip().lstrip("#")
+    try:
+        if len(s) == 3:
+            s = "".join(c * 2 for c in s)
+        if len(s) == 6:
+            return (int(s[0:2], 16) / 255.0, int(s[2:4], 16) / 255.0, int(s[4:6], 16) / 255.0)
+    except Exception:
+        pass
+    return fallback
+
+def rgb_to_hex(r, g, b):
+    return f"#{int(round(r * 255)):02X}{int(round(g * 255)):02X}{int(round(b * 255)):02X}"
+
+def shell_clean_exec(value):
+    if not value:
+        return ""
+    return re.sub(r"\s+%[fFuUdDnNickvm]", "", value).strip()
+
+def get_desktop_entry_value(path, key):
+    try:
+        for line in path.read_text(errors="ignore").splitlines():
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1]
+    except Exception:
+        pass
+    return ""
+
+def set_desktop_entry_key(path, key, value):
+    try:
+        lines = path.read_text(errors="ignore").splitlines()
+    except Exception:
+        lines = []
+
+    found = False
+    out = []
+    for line in lines:
+        if line.startswith(key + "="):
+            out.append(f"{key}={value}")
+            found = True
+        else:
+            out.append(line)
+
+    if not found:
+        out.append(f"{key}={value}")
+
+    path.write_text("\n".join(out) + "\n")
+
+def desktop_entry_enabled(path):
+    hidden = get_desktop_entry_value(path, "Hidden").lower()
+    gnome_enabled = get_desktop_entry_value(path, "X-GNOME-Autostart-enabled").lower()
+    return not (hidden == "true" or gnome_enabled == "false")
+
+# ----------------------------------------------------------------------
+# Config Handler
+# ----------------------------------------------------------------------
+class Config:
+    def __init__(self):
+        self.data = {}
+        self.load()
+
+    def ensure_exists(self):
+        if CONF.exists():
+            return
+        CONF.parent.mkdir(parents=True, exist_ok=True)
+        if DFLT.exists():
+            shutil.copy(DFLT, CONF)
+            CONF.chmod(0o644)
+        else:
+            CONF.write_text(self.default_text())
+
+    def default_text(self):
+        return """# MDEON user configuration
+
+MDEON_NAME="MDEON"
+FALLBACK_TERM="x-terminal-emulator"
+AUTOSTART_MODE="sequential"
+AUTOSTART_MANAGER="/usr/bin/mdeon-autostart"
+AUTOSTART_MANAGER_OPTIONS="--session"
+
+WALLPAPER=""
+FALLBACK_COLOR="#FFB6C1"
+
+VOLUME="pasystray"
+VOLUME_OPTIONS=""
+USE_VOLUME="true"
+
+X11_VOLUME=""
+X11_VOLUME_OPTIONS=""
+X11_USE_VOLUME=""
+
+WAYLAND_VOLUME=""
+WAYLAND_VOLUME_OPTIONS=""
+WAYLAND_USE_VOLUME=""
+
+DESKTOP_MANAGER="mdeon-desktop"
+DESKTOP_MANAGER_OPTIONS=""
+USE_DESKTOP_MANAGER="true"
+
+X11_DESKTOP_MANAGER="mdeon-desktop"
+X11_DESKTOP_MANAGER_OPTIONS=""
+X11_USE_DESKTOP_MANAGER="true"
+
+WINDOW_MANAGER="xfwm4"
+WINDOW_MANAGER_OPTIONS="--replace"
+
+WINDOW_COMPOSITOR=""
+WINDOW_COMPOSITOR_OPTIONS=""
+
+FLWM_MENU_SCRIPT="/usr/bin/gen-flwm-menu.sh"
+
+X11_DOCK_CMD="mdeon-panel"
+X11_DOCK_CMD_OPTIONS=""
+
+WAYLAND_COMPOSITOR="labwc"
+WAYLAND_COMPOSITOR_OPTIONS=""
+WAYLAND_DESKTOP_NAME="wlroots"
+
+WAYLAND_DESKTOP_MANAGER="mdeon-desktop"
+WAYLAND_DESKTOP_MANAGER_OPTIONS=""
+WAYLAND_USE_DESKTOP_MANAGER="true"
+
+MENU_SCRIPT="/usr/bin/gen-wayland-menu.sh"
+
+WAYLAND_DOCK_CMD="mdeon-panel"
+WAYLAND_DOCK_CMD_OPTIONS=""
+
+DEBUG_LOG_DIR=""
+DEBUG_LOG_MAX_FILES="5"
+"""
+
+    def load(self):
+        self.ensure_exists()
+        src = CONF if CONF.exists() else DFLT
+        if not src.exists():
+            return
+
+        try:
+            for line in src.read_text(errors="ignore").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                key, value = stripped.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ["'", '"']:
+                    value = value[1:-1]
+                value = value.replace('\\"', '"').replace("\\\\", "\\")
+                self.data[key] = value
+        except Exception as e:
+            logger.error(f"Error loading config: {e}")
+
+    def get(self, key, default=""):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = str(value)
+
+    def save(self):
+        template = DFLT if DFLT.exists() else CONF
+        if template.exists():
+            lines = template.read_text(errors="ignore").splitlines()
+        else:
+            lines = self.default_text().splitlines()
+
+        written = set()
+        out = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                key = stripped.split("=", 1)[0].strip()
+                if key in self.data:
+                    out.append(f"{key}={quote_value(self.data[key])}")
+                    written.add(key)
+                else:
+                    out.append(line)
+            else:
+                out.append(line)
+
+        for key in sorted(self.data.keys()):
+            if key not in written:
+                out.append(f"{key}={quote_value(self.data[key])}")
+
+        CONF.parent.mkdir(parents=True, exist_ok=True)
+        CONF.write_text("\n".join(out) + "\n")
+
+
+# ----------------------------------------------------------------------
+# Core Settings GUI Controller (Pure PyCairo)
+# ----------------------------------------------------------------------
+class MdeonSettingsCairo:
+    TABS = ["Common", "X11", "Wayland", "Autostart", "Tools"]
+
+    PALETTE_COLORS = [
+        "#FFB6C1", "#FF6B6B", "#FA5252", "#E64980",
+        "#BE4BDB", "#7950F2", "#4C6EF5", "#228BE6",
+        "#15AABF", "#12B886", "#40C057", "#82C91E",
+        "#FAB005", "#FD7E14", "#212529", "#1E1E2E",
+        "#2D2D2D", "#343A40", "#495057", "#868E96",
+        "#CED4DA", "#F8F9FA", "#FFFFFF", "#000000"
+    ]
+
+    def __init__(self, width, height, flush_cb):
+        self.width = width
+        self.height = height
+        self.flush_cb = flush_cb
+
+        self.cfg = Config()
+        self.active_tab = 0
+        self.status_msg = "Ready"
+        self.status_time = time.time()
+        self.scroll_y = 0
+        self.max_scroll_y = 0
+        self.scroll_x = 0
+        self.max_scroll_x = 0
+        self.scrollbar_dragging = False
+        self.scrollbar_drag_offset = 0
+        self.scrollbar = None
+        self.horizontal_scrollbar_dragging = False
+        self.horizontal_scrollbar_drag_offset = 0
+        self.horizontal_scrollbar = None
+
+        self.wp_path = self.autodetect_wallpaper()
+        if self.wp_path:
+            self.cfg.set("WALLPAPER", self.wp_path)
+
+        # Form fields state
+        self.form_values = {}
+        self.dropdown_popup = None
+        self.focused_entry = None
+        self.cursor_visible = True
+
+        # Modal State (e.g., Color Picker)
+        self.modal_active = False
+        self.modal_temp_color = "#FFB6C1"
+
+        # Autostart list cache
+        self.autostart_query = ""
+        self.autostart_items = []
+        self.refresh_autostart_list()
+
+        # UI Hitboxes: List of tuples (x, y, w, h, handler_func, hover_id)
+        self.interactive_rects = []
+        self.hovered_id = None
+
+        self.wp_preview_surface = None
+        self._init_form_values()
+        self.update_wallpaper_preview()
+        self._init_cairo()
+
+    def _init_cairo(self):
+        self.surface = cairo.ImageSurface(cairo.FORMAT_RGB24, self.width, self.height)
+        self.ctx = ThemedContext(cairo.Context(self.surface), prefers_light_scheme())
+        self.stride = self.surface.get_stride()
+        self.data_buffer = self.surface.get_data()
+
+    def _init_form_values(self):
+        self.form_values = {
+            # Common
+            "MDEON_NAME": self.cfg.get("MDEON_NAME", "MDEON"),
+            "FALLBACK_TERM": self.cfg.get("FALLBACK_TERM", "x-terminal-emulator"),
+            "AUTOSTART_MODE": self.cfg.get("AUTOSTART_MODE", "sequential"),
+            "AUTOSTART_MANAGER": self.cfg.get("AUTOSTART_MANAGER", "/usr/bin/mdeon-autostart"),
+            "AUTOSTART_MANAGER_OPTIONS": self.cfg.get("AUTOSTART_MANAGER_OPTIONS", "--session"),
+            "FALLBACK_COLOR": self.cfg.get("FALLBACK_COLOR", "#FFB6C1"),
+            "VOLUME": self.cfg.get("VOLUME", "pasystray"),
+            "VOLUME_OPTIONS": self.cfg.get("VOLUME_OPTIONS", ""),
+            "USE_VOLUME": self.cfg.get("USE_VOLUME", "true").lower() == "true",
+            "DEBUG_LOG_DIR": self.cfg.get("DEBUG_LOG_DIR", ""),
+            "DEBUG_LOG_MAX_FILES": self.cfg.get("DEBUG_LOG_MAX_FILES", "5"),
+
+            # X11
+            "X11_DESKTOP_MANAGER": self.cfg.get("X11_DESKTOP_MANAGER", "mdeon-desktop"),
+            "X11_DESKTOP_MANAGER_OPTIONS": self.cfg.get("X11_DESKTOP_MANAGER_OPTIONS", ""),
+            "X11_USE_DESKTOP_MANAGER": self.cfg.get("X11_USE_DESKTOP_MANAGER", "true").lower() == "true",
+            "WINDOW_MANAGER": self.cfg.get("WINDOW_MANAGER", "xfwm4"),
+            "WINDOW_MANAGER_OPTIONS": self.cfg.get("WINDOW_MANAGER_OPTIONS", "--replace"),
+            "WINDOW_COMPOSITOR": self.cfg.get("WINDOW_COMPOSITOR", ""),
+            "WINDOW_COMPOSITOR_OPTIONS": self.cfg.get("WINDOW_COMPOSITOR_OPTIONS", ""),
+            "X11_DOCK_CMD": self.cfg.get("X11_DOCK_CMD", "mdeon-panel"),
+            "X11_DOCK_CMD_OPTIONS": self.cfg.get("X11_DOCK_CMD_OPTIONS", ""),
+            "X11_VOLUME": self.cfg.get("X11_VOLUME", ""),
+            "X11_VOLUME_OPTIONS": self.cfg.get("X11_VOLUME_OPTIONS", ""),
+            "X11_USE_VOLUME": self.cfg.get("X11_USE_VOLUME", "false").lower() == "true",
+            "FLWM_MENU_SCRIPT": self.cfg.get("FLWM_MENU_SCRIPT", "/usr/bin/gen-flwm-menu.sh"),
+
+            # Wayland
+            "WAYLAND_COMPOSITOR": self.cfg.get("WAYLAND_COMPOSITOR", "labwc"),
+            "WAYLAND_COMPOSITOR_OPTIONS": self.cfg.get("WAYLAND_COMPOSITOR_OPTIONS", ""),
+            "WAYLAND_DESKTOP_NAME": self.cfg.get("WAYLAND_DESKTOP_NAME", "wlroots"),
+            "WAYLAND_DESKTOP_MANAGER": self.cfg.get("WAYLAND_DESKTOP_MANAGER", "mdeon-desktop"),
+            "WAYLAND_DESKTOP_MANAGER_OPTIONS": self.cfg.get("WAYLAND_DESKTOP_MANAGER_OPTIONS", ""),
+            "WAYLAND_USE_DESKTOP_MANAGER": self.cfg.get("WAYLAND_USE_DESKTOP_MANAGER", "true").lower() == "true",
+            "WAYLAND_DOCK_CMD": self.cfg.get("WAYLAND_DOCK_CMD", "mdeon-panel"),
+            "WAYLAND_DOCK_CMD_OPTIONS": self.cfg.get("WAYLAND_DOCK_CMD_OPTIONS", ""),
+            "WAYLAND_VOLUME": self.cfg.get("WAYLAND_VOLUME", ""),
+            "WAYLAND_VOLUME_OPTIONS": self.cfg.get("WAYLAND_VOLUME_OPTIONS", ""),
+            "WAYLAND_USE_VOLUME": self.cfg.get("WAYLAND_USE_VOLUME", "false").lower() == "true",
+            "MENU_SCRIPT": self.cfg.get("MENU_SCRIPT", "/usr/bin/gen-wayland-menu.sh"),
+        }
+        self.modal_temp_color = self.form_values["FALLBACK_COLOR"]
+
+        if (
+            self.cmd_base(self.form_values["WAYLAND_COMPOSITOR"]) == "kwin_wayland"
+            and not self.form_values["WAYLAND_COMPOSITOR_OPTIONS"].strip()
+        ):
+            self.form_values["WAYLAND_COMPOSITOR_OPTIONS"] = "--xwayland"
+
+    def update_wallpaper_preview(self):
+        self.wp_preview_surface = None
+        if HAVE_PIL and self.wp_path and os.path.exists(self.wp_path):
+            try:
+                im = Image.open(self.wp_path).convert("RGBA")
+                target_w, target_h = 300, 160
+                im.thumbnail((target_w, target_h), Image.Resampling.BILINEAR)
+                
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                buf.seek(0)
+                self.wp_preview_surface = cairo.ImageSurface.create_from_png(buf)
+            except Exception as e:
+                logger.error(f"Wallpaper preview generation error: {e}")
+
+    def autodetect_wallpaper(self):
+        def clean(path):
+            if not path:
+                return ""
+            p = path.strip().strip("'").strip('"').replace("file://", "").strip()
+            return p if (os.path.exists(p) and os.access(p, os.R_OK)) else ""
+
+        cfg_wp = clean(self.cfg.get("WALLPAPER"))
+        if cfg_wp:
+            return cfg_wp
+
+        de_vars = (
+            os.environ.get("XDG_CURRENT_DESKTOP", "") + " " +
+            os.environ.get("DESKTOP_SESSION", "") + " " +
+            os.environ.get("MDEON_SESSION_COMPOSITOR", "")
+        ).lower()
+
+        try:
+            if "cinnamon" in de_vars:
+                wp = clean(subprocess.check_output(
+                    "gsettings get org.cinnamon.desktop.background picture-uri",
+                    shell=True, text=True, stderr=subprocess.DEVNULL
+                ))
+                if wp: return wp
+            elif "gnome" in de_vars or "ubuntu" in de_vars:
+                wp = clean(subprocess.check_output(
+                    "gsettings get org.gnome.desktop.background picture-uri",
+                    shell=True, text=True, stderr=subprocess.DEVNULL
+                ))
+                if wp: return wp
+            elif "mate" in de_vars:
+                wp = clean(subprocess.check_output(
+                    "gsettings get org.mate.background picture-filename",
+                    shell=True, text=True, stderr=subprocess.DEVNULL
+                ))
+                if wp: return wp
+            elif "xfce" in de_vars:
+                out = subprocess.check_output(
+                    "xfconf-query -c xfce4-desktop -l | grep last-image",
+                    shell=True, text=True, stderr=subprocess.DEVNULL
+                )
+                for prop in out.splitlines():
+                    val = clean(subprocess.check_output(
+                        f"xfconf-query -c xfce4-desktop -p {shlex.quote(prop)}",
+                        shell=True, text=True, stderr=subprocess.DEVNULL
+                    ))
+                    if val: return val
+        except Exception:
+            pass
+
+        try:
+            for line in Path("/etc/lightdm/slick-greeter.conf").read_text(errors="ignore").splitlines():
+                if line.strip().startswith("background="):
+                    bg = clean(line.split("=", 1)[1])
+                    if bg: return bg
+        except Exception:
+            pass
+
+        return ""
+
+    def apply_wallpaper(self):
+        if not self.wp_path or not os.path.exists(self.wp_path):
+            return
+        wp = shlex.quote(self.wp_path)
+        if SESSION_TYPE == "wayland":
+            if has("swaybg"):
+                run("killall swaybg 2>/dev/null")
+                run(f"swaybg -i {wp} -m fill")
+        else:
+            if has("xwallpaper"):
+                run(f"xwallpaper --zoom {wp}")
+
+        try:
+            uid = os.getuid()
+            run(
+                f"gdbus call --system "
+                f"--dest org.freedesktop.Accounts "
+                f"--object-path /org/freedesktop/Accounts/User{uid} "
+                f"--method org.freedesktop.DBus.Properties.Set "
+                f"'org.freedesktop.DisplayManager.AccountsService' "
+                f"'BackgroundFile' \"<'{self.wp_path}'>\""
+            )
+        except Exception:
+            pass
+
+    def cmd_base(self, value):
+        value = (value or "").strip()
+        if not value: return ""
+        try:
+            parts = shlex.split(value)
+            if parts: value = parts[0]
+        except Exception:
+            value = value.split()[0] if value.split() else value
+        return os.path.basename(value).lower()
+
+    def default_options_for_program(self, role, cmd):
+        base = self.cmd_base(cmd)
+        defaults = {
+            ("autostart-manager", "mdeon-autostart"): "--session",
+            ("x11-window-manager", "xfwm4"): "--replace",
+            ("x11-desktop-manager", "mdeon-desktop"): "",
+            ("x11-desktop-manager", "spacefm"): "--desktop",
+            ("x11-desktop-manager", "pcmanfm"): "--desktop",
+            ("wayland-dock", "waybar"): "",
+            ("wayland-dock", "wf-panel-pi"): "",
+            ("wayland-dock", "sfwbar"): "",
+            ("wayland-dock", "yambar"): "",
+            ("wayland-dock", "nwg-panel"): "",
+            ("wayland-dock", "lavalauncher"): "",
+            ("wayland-dock", "cairo-dock"): "",
+            ("wayland-dock", "crystal-dock"): "",
+            ("wayland-dock", "xfce4-panel"): "",
+            ("wayland-dock", "lxqt-panel"): "",
+            ("wayland-dock", "panel-session-anchor"): "",
+            ("wayland-dock", "mdeon-panel"): "",
+            ("x11-dock", "mdeon-panel"): "",
+            ("x11-dock", "tint2"): "",
+            ("x11-dock", "plank"): "",
+            ("x11-dock", "polybar"): "",
+            ("x11-dock", "xfce4-panel"): "",
+            ("x11-dock", "lxqt-panel"): "",
+            ("x11-dock", "panel-session-anchor"): "",
+            ("wayland-compositor", "labwc"): "",
+            ("wayland-compositor", "sway"): "",
+            ("wayland-compositor", "wayfire"): "",
+            ("wayland-compositor", "hyprland"): "",
+            ("wayland-compositor", "hikari"): "",
+            ("wayland-compositor", "weston"): "",
+            ("wayland-compositor", "river"): "",
+            ("wayland-compositor", "kwin_wayland"): "--xwayland",
+            ("x11-compositor", "picom"): "",
+            ("x11-compositor", "compton"): "",
+            ("x11-compositor", "xcompmgr"): "",
+            ("volume", "pasystray"): "",
+            ("volume", "volumeicon"): "",
+            ("volume", "pnmixer"): "",
+            ("desktop-manager", "mdeon-desktop"): "",
+            ("desktop-manager", "waylandminimal-desktop"): "",
+            ("desktop-manager", "pcmanfm-qt"): "",
+            ("desktop-manager", "nemo"): "",
+            ("desktop-manager", "caja"): "",
+            ("desktop-manager", "spacefm"): "",
+        }
+        return defaults.get((role, base), "")
+
+    def set_program_option_pair(self, cmd_key, options_key, new_cmd, typed_options, role, reset_log):
+        old_cmd = self.cfg.get(cmd_key)
+        old_options = self.cfg.get(options_key)
+        old_base = self.cmd_base(old_cmd)
+        new_base = self.cmd_base(new_cmd)
+
+        self.cfg.set(cmd_key, new_cmd)
+        if old_base != new_base:
+            safe_options = self.default_options_for_program(role, new_cmd)
+            self.cfg.set(options_key, safe_options)
+            self.form_values[options_key] = safe_options
+            reset_log.append(
+                f"{cmd_key}: {old_cmd or '<none>'} → {new_cmd or '<none>'}; "
+                f"{options_key} reset to {safe_options or '<empty>'}"
+            )
+        else:
+            self.cfg.set(options_key, typed_options)
+            self.form_values[options_key] = typed_options
+
+    def save_settings(self):
+        reset_log = []
+
+        # Common
+        self.cfg.set("MDEON_NAME", self.form_values["MDEON_NAME"])
+        self.cfg.set("FALLBACK_TERM", self.form_values["FALLBACK_TERM"])
+        self.cfg.set("AUTOSTART_MODE", self.form_values["AUTOSTART_MODE"])
+        self.set_program_option_pair(
+            "AUTOSTART_MANAGER", "AUTOSTART_MANAGER_OPTIONS",
+            self.form_values["AUTOSTART_MANAGER"], self.form_values["AUTOSTART_MANAGER_OPTIONS"],
+            "autostart-manager", reset_log
+        )
+        self.cfg.set("WALLPAPER", self.wp_path or "")
+        self.cfg.set("FALLBACK_COLOR", self.form_values["FALLBACK_COLOR"])
+        self.set_program_option_pair(
+            "VOLUME", "VOLUME_OPTIONS",
+            self.form_values["VOLUME"], self.form_values["VOLUME_OPTIONS"],
+            "volume", reset_log
+        )
+        self.cfg.set("USE_VOLUME", "true" if self.form_values["USE_VOLUME"] else "false")
+        self.cfg.set("DEBUG_LOG_DIR", self.form_values["DEBUG_LOG_DIR"])
+        self.cfg.set("DEBUG_LOG_MAX_FILES", self.form_values["DEBUG_LOG_MAX_FILES"])
+
+        # X11
+        self.set_program_option_pair(
+            "X11_DESKTOP_MANAGER", "X11_DESKTOP_MANAGER_OPTIONS",
+            self.form_values["X11_DESKTOP_MANAGER"], self.form_values["X11_DESKTOP_MANAGER_OPTIONS"],
+            "x11-desktop-manager", reset_log
+        )
+        self.cfg.set("X11_USE_DESKTOP_MANAGER", "true" if self.form_values["X11_USE_DESKTOP_MANAGER"] else "false")
+        self.set_program_option_pair(
+            "WINDOW_MANAGER", "WINDOW_MANAGER_OPTIONS",
+            self.form_values["WINDOW_MANAGER"], self.form_values["WINDOW_MANAGER_OPTIONS"],
+            "x11-window-manager", reset_log
+        )
+        self.set_program_option_pair(
+            "WINDOW_COMPOSITOR", "WINDOW_COMPOSITOR_OPTIONS",
+            self.form_values["WINDOW_COMPOSITOR"], self.form_values["WINDOW_COMPOSITOR_OPTIONS"],
+            "x11-compositor", reset_log
+        )
+        self.set_program_option_pair(
+            "X11_DOCK_CMD", "X11_DOCK_CMD_OPTIONS",
+            self.form_values["X11_DOCK_CMD"], self.form_values["X11_DOCK_CMD_OPTIONS"],
+            "x11-dock", reset_log
+        )
+        self.set_program_option_pair(
+            "X11_VOLUME", "X11_VOLUME_OPTIONS",
+            self.form_values["X11_VOLUME"], self.form_values["X11_VOLUME_OPTIONS"],
+            "volume", reset_log
+        )
+        self.cfg.set("X11_USE_VOLUME", "true" if self.form_values["X11_USE_VOLUME"] else "false")
+        self.cfg.set("FLWM_MENU_SCRIPT", self.form_values["FLWM_MENU_SCRIPT"])
+
+        # Wayland
+        self.set_program_option_pair(
+            "WAYLAND_COMPOSITOR", "WAYLAND_COMPOSITOR_OPTIONS",
+            self.form_values["WAYLAND_COMPOSITOR"], self.form_values["WAYLAND_COMPOSITOR_OPTIONS"],
+            "wayland-compositor", reset_log
+        )
+        self.cfg.set("WAYLAND_DESKTOP_NAME", self.form_values["WAYLAND_DESKTOP_NAME"])
+        self.set_program_option_pair(
+            "WAYLAND_DESKTOP_MANAGER", "WAYLAND_DESKTOP_MANAGER_OPTIONS",
+            self.form_values["WAYLAND_DESKTOP_MANAGER"], self.form_values["WAYLAND_DESKTOP_MANAGER_OPTIONS"],
+            "desktop-manager", reset_log
+        )
+        self.cfg.set("WAYLAND_USE_DESKTOP_MANAGER", "true" if self.form_values["WAYLAND_USE_DESKTOP_MANAGER"] else "false")
+        self.set_program_option_pair(
+            "WAYLAND_DOCK_CMD", "WAYLAND_DOCK_CMD_OPTIONS",
+            self.form_values["WAYLAND_DOCK_CMD"], self.form_values["WAYLAND_DOCK_CMD_OPTIONS"],
+            "wayland-dock", reset_log
+        )
+        self.set_program_option_pair(
+            "WAYLAND_VOLUME", "WAYLAND_VOLUME_OPTIONS",
+            self.form_values["WAYLAND_VOLUME"], self.form_values["WAYLAND_VOLUME_OPTIONS"],
+            "volume", reset_log
+        )
+        self.cfg.set("WAYLAND_USE_VOLUME", "true" if self.form_values["WAYLAND_USE_VOLUME"] else "false")
+        self.cfg.set("MENU_SCRIPT", self.form_values["MENU_SCRIPT"])
+
+        self.cfg.save()
+        self.apply_wallpaper()
+
+        if reset_log:
+            self.status_msg = f"Saved! Reset {len(reset_log)} options: {reset_log[0]}"
+        else:
+            self.status_msg = "Settings saved successfully."
+        self.status_time = time.time()
+        self.redraw()
+
+    def refresh_autostart_list(self):
+        files = {}
+        for directory in [SYS_AUTO, USER_AUTO]:
+            if not directory.exists(): continue
+            for path in directory.glob("*.desktop"):
+                files[path.name] = path
+
+        self.autostart_items = []
+        for name, path in sorted(files.items()):
+            title = get_desktop_entry_value(path, "Name") or name.replace(".desktop", "").replace("-", " ").title()
+            exec_line = shell_clean_exec(get_desktop_entry_value(path, "Exec"))
+            enabled = desktop_entry_enabled(path)
+            self.autostart_items.append({
+                "name": name,
+                "title": title,
+                "exec": exec_line,
+                "path": path,
+                "enabled": enabled
+            })
+
+    def toggle_autostart(self, item):
+        target = USER_AUTO / item["name"]
+        if item["path"] != target:
+            try:
+                shutil.copy(item["path"], target)
+            except Exception:
+                return
+
+        new_state = not item["enabled"]
+        item["enabled"] = new_state
+        if new_state:
+            set_desktop_entry_key(target, "Hidden", "false")
+            set_desktop_entry_key(target, "X-GNOME-Autostart-enabled", "true")
+            set_desktop_entry_key(target, "NoDisplay", "false")
+        else:
+            set_desktop_entry_key(target, "Hidden", "true")
+            set_desktop_entry_key(target, "X-GNOME-Autostart-enabled", "false")
+        self.refresh_autostart_list()
+        self.redraw()
+
+    # ------------------------------------------------------------------
+    # Cairo Drawing Helpers
+    # ------------------------------------------------------------------
+    def _round_rect(self, x, y, w, h, r=4):
+        self.ctx.new_sub_path()
+        self.ctx.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        self.ctx.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        self.ctx.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        self.ctx.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        self.ctx.close_path()
+
+    def draw_button(self, x, y, w, h, text, callback, btn_id, primary=False):
+        is_hovered = (self.hovered_id == btn_id)
+        if primary:
+            bg = (0.21, 0.52, 0.89) if not is_hovered else (0.28, 0.60, 0.96)
+            fg = (1.0, 1.0, 1.0)
+        else:
+            bg = (0.22, 0.22, 0.24) if not is_hovered else (0.28, 0.28, 0.30)
+            fg = (0.9, 0.9, 0.9)
+
+        self.ctx.set_source_rgb(*bg)
+        self._round_rect(x, y, w, h, 4)
+        self.ctx.fill()
+
+        self.ctx.set_source_rgb(0.35, 0.35, 0.38)
+        self.ctx.set_line_width(1)
+        self._round_rect(x, y, w, h, 4)
+        self.ctx.stroke()
+
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD if primary else cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(12)
+        ext = self.ctx.text_extents(text)
+        self.ctx.set_source_rgb(*fg)
+        self.ctx.move_to(x + (w - ext.width) / 2, y + (h + ext.height) / 2 - 2)
+        self.ctx.show_text(text)
+
+        self.interactive_rects.append((x, y, w, h, callback, btn_id))
+
+    def draw_entry(self, x, y, w, h, key, entry_id):
+        val = str(self.form_values.get(key, ""))
+        is_focused = (self.focused_entry == key)
+
+        self.ctx.set_source_rgb(0.12, 0.12, 0.14)
+        self._round_rect(x, y, w, h, 4)
+        self.ctx.fill()
+
+        self.ctx.set_source_rgb(*( (0.21, 0.52, 0.89) if is_focused else (0.25, 0.25, 0.28) ))
+        self.ctx.set_line_width(1.5 if is_focused else 1)
+        self._round_rect(x, y, w, h, 4)
+        self.ctx.stroke()
+
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(12)
+        self.ctx.set_source_rgb(0.9, 0.9, 0.9)
+        self.ctx.move_to(x + 8, y + h / 2 + 4)
+        display_text = val if len(val) <= 45 else "..." + val[-42:]
+        self.ctx.show_text(display_text)
+
+        if is_focused and self.cursor_visible:
+            ext = self.ctx.text_extents(display_text)
+            cx = x + 10 + ext.width
+            self.ctx.set_source_rgb(1.0, 1.0, 1.0)
+            self.ctx.move_to(cx, y + 6)
+            self.ctx.line_to(cx, y + h - 6)
+            self.ctx.stroke()
+
+        def on_click():
+            self.focused_entry = key
+            self.dropdown_popup = None
+        self.interactive_rects.append((x, y, w, h, on_click, entry_id))
+
+    def draw_dropdown(self, x, y, w, h, key, items, dropdown_id):
+        val = str(self.form_values.get(key, ""))
+        is_hovered = (self.hovered_id == dropdown_id)
+
+        self.ctx.set_source_rgb(*( (0.20, 0.20, 0.22) if not is_hovered else (0.25, 0.25, 0.28) ))
+        self._round_rect(x, y, w, h, 4)
+        self.ctx.fill()
+
+        self.ctx.set_source_rgb(0.3, 0.3, 0.33)
+        self.ctx.set_line_width(1)
+        self._round_rect(x, y, w, h, 4)
+        self.ctx.stroke()
+
+        display_text = val if val else "none"
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(12)
+        self.ctx.set_source_rgb(0.9, 0.9, 0.9)
+        self.ctx.move_to(x + 10, y + h / 2 + 4)
+        self.ctx.show_text(display_text)
+
+        # Draw Down Arrow
+        self.ctx.set_source_rgb(0.7, 0.7, 0.7)
+        self.ctx.move_to(x + w - 18, y + h / 2 - 2)
+        self.ctx.line_to(x + w - 10, y + h / 2 - 2)
+        self.ctx.line_to(x + w - 14, y + h / 2 + 3)
+        self.ctx.close_path()
+        self.ctx.fill()
+
+        def open_popup():
+            options = list(items)
+            if "none" not in options: options.append("none")
+            item_h = 26
+            ph = min(len(options) * item_h + 8, 220)
+            py = y + h + 2 if (y + h + ph < self.height - 60) else (y - ph - 2)
+            popup_x = x - self.scroll_x
+
+            def select_item(chosen):
+                self.form_values[key] = "" if chosen == "none" else chosen
+                self.dropdown_popup = None
+                self.redraw()
+
+            self.dropdown_popup = (popup_x, py, w, ph, options, select_item)
+            self.focused_entry = None
+            self.redraw()
+
+        self.interactive_rects.append((x, y, w, h, open_popup, dropdown_id))
+
+    def draw_toggle(self, x, y, key, toggle_id):
+        active = bool(self.form_values.get(key, False))
+        w, h = 42, 22
+
+        self.ctx.set_source_rgb(*( (0.21, 0.52, 0.89) if active else (0.25, 0.25, 0.28) ))
+        self._round_rect(x, y, w, h, 11)
+        self.ctx.fill()
+
+        kx = x + w - 19 if active else x + 3
+        self.ctx.set_source_rgb(1.0, 1.0, 1.0)
+        self._round_rect(kx, y + 3, 16, 16, 8)
+        self.ctx.fill()
+
+        def on_toggle():
+            self.form_values[key] = not self.form_values.get(key, False)
+            self.redraw()
+
+        self.interactive_rects.append((x, y, w, h, on_toggle, toggle_id))
+
+    def open_color_selector(self):
+        # Try system Zenity color picker first
+        if has("zenity"):
+            init_c = self.form_values.get("FALLBACK_COLOR", "#FFB6C1")
+            try:
+                res = subprocess.run(
+                    ["zenity", "--color-selection", f"--color={init_c}", "--show-palette", "--title=Select Fallback Color"],
+                    stdout=subprocess.PIPE, text=True
+                )
+                chosen = res.stdout.strip()
+                if chosen:
+                    if chosen.startswith("rgb"):
+                        # Parse rgb(r,g,b)
+                        nums = [int(n) for n in re.findall(r"\d+", chosen)[:3]]
+                        chosen = f"#{nums[0]:02X}{nums[1]:02X}{nums[2]:02X}"
+                    self.form_values["FALLBACK_COLOR"] = chosen
+                    self.redraw()
+                    return
+            except Exception:
+                pass
+
+        # Fallback to pure Cairo built-in modal
+        self.modal_temp_color = self.form_values.get("FALLBACK_COLOR", "#FFB6C1")
+        self.modal_active = True
+        self.redraw()
+
+    # ------------------------------------------------------------------
+    # Tab Renderers
+    # ------------------------------------------------------------------
+    def draw_common_tab(self, y):
+        start_y = y
+        # Section General
+        self.ctx.set_source_rgb(0.38, 0.68, 0.93)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        self.ctx.set_font_size(13)
+        self.ctx.move_to(30, y + 15)
+        self.ctx.show_text("General")
+        y += 28
+
+        # Desktop name
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(12)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Desktop name")
+        self.draw_entry(220, y, 320, 26, "MDEON_NAME", "ent_mdeon_name")
+        y += 34
+
+        # Fallback terminal
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Fallback terminal")
+        self.draw_entry(220, y, 320, 26, "FALLBACK_TERM", "ent_fb_term")
+        y += 34
+
+        # Autostart mode
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Autostart mode")
+        self.draw_dropdown(220, y, 320, 26, "AUTOSTART_MODE", ["sequential", "parallel"], "dd_auto_mode")
+        y += 34
+
+        # Autostart manager
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Autostart manager")
+        self.draw_entry(220, y, 320, 26, "AUTOSTART_MANAGER", "ent_auto_mgr")
+        y += 34
+
+        # Autostart options
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Autostart options")
+        self.draw_entry(220, y, 320, 26, "AUTOSTART_MANAGER_OPTIONS", "ent_auto_opt")
+        y += 44
+
+        # Section Appearance
+        self.ctx.set_source_rgb(0.38, 0.68, 0.93)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        self.ctx.set_font_size(13)
+        self.ctx.move_to(30, y + 15)
+        self.ctx.show_text("Appearance")
+        y += 28
+
+        # --- Wallpaper Preview Frame ---
+        preview_box_w, preview_box_h = 320, 170
+        self.ctx.set_source_rgb(0.10, 0.10, 0.12)
+        self._round_rect(220, y, preview_box_w, preview_box_h, 6)
+        self.ctx.fill()
+
+        self.ctx.set_source_rgb(0.24, 0.24, 0.28)
+        self.ctx.set_line_width(1)
+        self._round_rect(220, y, preview_box_w, preview_box_h, 6)
+        self.ctx.stroke()
+
+        if self.wp_preview_surface:
+            pw = self.wp_preview_surface.get_width()
+            ph = self.wp_preview_surface.get_height()
+            px = 220 + (preview_box_w - pw) // 2
+            py = y + (preview_box_h - ph) // 2
+            self.ctx.set_source_surface(self.wp_preview_surface, px, py)
+            self.ctx.paint()
+        else:
+            self.ctx.set_source_rgb(0.5, 0.5, 0.55)
+            self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            self.ctx.set_font_size(11)
+            ext = self.ctx.text_extents("No Wallpaper Preview")
+            self.ctx.move_to(220 + (preview_box_w - ext.width) / 2, y + preview_box_h / 2 + 4)
+            self.ctx.show_text("No Wallpaper Preview")
+
+        y += preview_box_h + 12
+
+        # Wallpaper selection row
+        wp_label = "Wallpaper: " + (os.path.basename(self.wp_path) if self.wp_path else "None")
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(12)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text(wp_label)
+
+        def browse_wp():
+            if has("zenity"):
+                res = subprocess.run(["zenity", "--file-selection", "--title=Select Wallpaper"], stdout=subprocess.PIPE, text=True)
+                path = res.stdout.strip()
+                if path and os.path.exists(path):
+                    self.wp_path = path
+                    self.update_wallpaper_preview()
+                    self.redraw()
+        self.draw_button(220, y, 100, 26, "Browse...", browse_wp, "btn_browse_wp")
+        y += 38
+
+        # --- Fallback Color Button & Chip ---
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Fallback color")
+
+        # Color entry
+        self.draw_entry(220, y, 120, 26, "FALLBACK_COLOR", "ent_fb_col")
+
+        # Color picker button with live preview swatch
+        chip_x, chip_y = 350, y
+        chip_w, chip_h = 40, 26
+        self.ctx.set_source_rgb_raw(*hex_to_rgb(self.form_values["FALLBACK_COLOR"]))
+        self._round_rect(chip_x, chip_y, chip_w, chip_h, 4)
+        self.ctx.fill()
+        self.ctx.set_source_rgb(0.4, 0.4, 0.45)
+        self.ctx.set_line_width(1)
+        self._round_rect(chip_x, chip_y, chip_w, chip_h, 4)
+        self.ctx.stroke()
+        self.interactive_rects.append((chip_x, chip_y, chip_w, chip_h, self.open_color_selector, "btn_col_chip"))
+
+        self.draw_button(400, y, 100, 26, "Pick Color", self.open_color_selector, "btn_open_picker")
+        y += 48
+
+        # Volume
+        self.ctx.set_source_rgb(0.38, 0.68, 0.93)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        self.ctx.set_font_size(13)
+        self.ctx.move_to(30, y + 15)
+        self.ctx.show_text("Common Volume Fallback")
+        y += 28
+
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(12)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Volume Control")
+        vol_items = available(["pasystray", "volumeicon", "pnmixer", "none"])
+        self.draw_dropdown(220, y, 220, 26, "VOLUME", vol_items, "dd_com_vol")
+        self.draw_toggle(450, y + 2, "USE_VOLUME", "tog_com_vol")
+        self.draw_entry(500, y, 200, 26, "VOLUME_OPTIONS", "ent_com_vol_opt")
+        y += 44
+
+        # Diagnostics
+        self.ctx.set_source_rgb(0.38, 0.68, 0.93)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        self.ctx.set_font_size(13)
+        self.ctx.move_to(30, y + 15)
+        self.ctx.show_text("Diagnostics")
+        y += 28
+
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(12)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Debug log dir")
+        self.draw_entry(220, y, 320, 26, "DEBUG_LOG_DIR", "ent_dbg_dir")
+        y += 34
+
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Max log files")
+        self.draw_entry(220, y, 100, 26, "DEBUG_LOG_MAX_FILES", "ent_dbg_max")
+        y += 50
+        return y - start_y
+
+    def draw_x11_tab(self, y):
+        start_y = y
+        self.ctx.set_source_rgb(0.38, 0.68, 0.93)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        self.ctx.set_font_size(13)
+        self.ctx.move_to(30, y + 15)
+        self.ctx.show_text("X11 Session Programs")
+        y += 28
+
+        dm_items = available(["mdeon-desktop", "spacefm", "pcmanfm", "caja", "nemo", "none"])
+        wm_items = available(["xfwm4", "openbox", "i3", "fluxbox", "icewm", "flwm", "awesome", "none"])
+        comp_items = available(["picom", "compton", "xcompmgr", "none"])
+        dock_items = available(["mdeon-panel", "tint2", "plank", "polybar", "xfce4-panel", "lxqt-panel", "panel-session-anchor", "none"])
+        vol_items = available(["pasystray", "volumeicon", "pnmixer", "none"])
+
+        rows = [
+            ("Desktop Manager", "X11_DESKTOP_MANAGER", "X11_DESKTOP_MANAGER_OPTIONS", dm_items, "X11_USE_DESKTOP_MANAGER"),
+            ("Window Manager", "WINDOW_MANAGER", "WINDOW_MANAGER_OPTIONS", wm_items, None),
+            ("Compositor", "WINDOW_COMPOSITOR", "WINDOW_COMPOSITOR_OPTIONS", comp_items, None),
+            ("Dock / Panel", "X11_DOCK_CMD", "X11_DOCK_CMD_OPTIONS", dock_items, None),
+            ("Volume Override", "X11_VOLUME", "X11_VOLUME_OPTIONS", vol_items, "X11_USE_VOLUME"),
+        ]
+
+        for idx, (label, cmd_k, opt_k, items, toggle_k) in enumerate(rows):
+            self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+            self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            self.ctx.set_font_size(12)
+            self.ctx.move_to(30, y + 18)
+            self.ctx.show_text(label)
+
+            self.draw_dropdown(220, y, 220, 26, cmd_k, items, f"dd_x11_{idx}")
+            if toggle_k:
+                self.draw_toggle(450, y + 2, toggle_k, f"tog_x11_{idx}")
+                self.draw_entry(500, y, 260, 26, opt_k, f"ent_x11_opt_{idx}")
+            else:
+                self.draw_entry(450, y, 310, 26, opt_k, f"ent_x11_opt_{idx}")
+            y += 38
+
+        # FLWM Menu Script
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("FLWM menu script")
+        self.draw_entry(220, y, 380, 26, "FLWM_MENU_SCRIPT", "ent_flwm_menu")
+        y += 50
+        return y - start_y
+
+    def draw_wayland_tab(self, y):
+        start_y = y
+        self.ctx.set_source_rgb(0.38, 0.68, 0.93)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        self.ctx.set_font_size(13)
+        self.ctx.move_to(30, y + 15)
+        self.ctx.show_text("Wayland Session Programs")
+        y += 28
+
+        comp_items = available(["labwc", "sway", "wayfire", "hyprland", "hikari", "weston", "river", "kwin_wayland", "mdeon-gnome-shell", "none"])
+        dm_items = available(["mdeon-desktop", "waylandminimal-desktop", "pcmanfm-qt", "nemo", "caja", "spacefm", "none"])
+        dock_items = available(["mdeon-panel", "waybar", "wf-panel-pi", "sfwbar", "yambar", "nwg-panel", "lavalauncher", "cairo-dock", "crystal-dock", "xfce4-panel", "lxqt-panel", "none"])
+        vol_items = available(["pasystray", "volumeicon", "pnmixer", "none"])
+
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(12)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Wayland Compositor")
+        self.draw_dropdown(220, y, 220, 26, "WAYLAND_COMPOSITOR", comp_items, "dd_wl_comp")
+        self.draw_entry(450, y, 310, 26, "WAYLAND_COMPOSITOR_OPTIONS", "ent_wl_comp_opt")
+        y += 38
+
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Wayland desktop name")
+        self.draw_entry(220, y, 220, 26, "WAYLAND_DESKTOP_NAME", "ent_wl_dt_name")
+        y += 38
+
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Desktop Manager")
+        self.draw_dropdown(220, y, 220, 26, "WAYLAND_DESKTOP_MANAGER", dm_items, "dd_wl_dm")
+        self.draw_toggle(450, y + 2, "WAYLAND_USE_DESKTOP_MANAGER", "tog_wl_dm")
+        self.draw_entry(500, y, 260, 26, "WAYLAND_DESKTOP_MANAGER_OPTIONS", "ent_wl_dm_opt")
+        y += 38
+
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Dock / Panel")
+        self.draw_dropdown(220, y, 220, 26, "WAYLAND_DOCK_CMD", dock_items, "dd_wl_dock")
+        self.draw_entry(450, y, 310, 26, "WAYLAND_DOCK_CMD_OPTIONS", "ent_wl_dock_opt")
+        y += 38
+
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Volume Override")
+        self.draw_dropdown(220, y, 220, 26, "WAYLAND_VOLUME", vol_items, "dd_wl_vol")
+        self.draw_toggle(450, y + 2, "WAYLAND_USE_VOLUME", "tog_wl_vol")
+        self.draw_entry(500, y, 260, 26, "WAYLAND_VOLUME_OPTIONS", "ent_wl_vol_opt")
+        y += 38
+
+        self.ctx.set_source_rgb(0.8, 0.8, 0.8)
+        self.ctx.move_to(30, y + 18)
+        self.ctx.show_text("Wayland menu script")
+        self.draw_entry(220, y, 380, 26, "MENU_SCRIPT", "ent_wl_menu")
+        y += 50
+        return y - start_y
+
+    def draw_autostart_tab(self, y):
+        start_y = y
+        self.draw_entry(30, y, 400, 28, "autostart_query", "ent_as_search")
+        self.draw_button(440, y, 90, 28, "Refresh", lambda: [self.refresh_autostart_list(), self.redraw()], "btn_as_refresh")
+        self.draw_button(540, y, 160, 28, "Open MDEON Autostart", lambda: run("mdeon-autostart"), "btn_as_open")
+        y += 40
+
+        query = str(self.form_values.get("autostart_query", "")).lower()
+        visible_items = [
+            it for it in self.autostart_items
+            if not query or query in it["name"].lower() or query in it["title"].lower() or query in it["exec"].lower()
+        ]
+
+        for idx, it in enumerate(visible_items):
+            box_y = y
+            self.ctx.set_source_rgb(0.16, 0.16, 0.18)
+            self._round_rect(30, box_y, self.width - 60, 48, 6)
+            self.ctx.fill()
+
+            self.ctx.set_source_rgb(0.24, 0.24, 0.28)
+            self._round_rect(30, box_y, self.width - 60, 48, 6)
+            self.ctx.stroke()
+
+            sw_x, sw_y = 45, box_y + 13
+            self.ctx.set_source_rgb(*( (0.21, 0.52, 0.89) if it["enabled"] else (0.28, 0.28, 0.32) ))
+            self._round_rect(sw_x, sw_y, 42, 22, 11)
+            self.ctx.fill()
+
+            kx = sw_x + 42 - 19 if it["enabled"] else sw_x + 3
+            self.ctx.set_source_rgb(1.0, 1.0, 1.0)
+            self._round_rect(kx, sw_y + 3, 16, 16, 8)
+            self.ctx.fill()
+
+            def make_toggle(item):
+                return lambda: self.toggle_autostart(item)
+            self.interactive_rects.append((sw_x, sw_y, 42, 22, make_toggle(it), f"as_tog_{idx}"))
+
+            self.ctx.set_source_rgb(0.95, 0.95, 0.95)
+            self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            self.ctx.set_font_size(12)
+            self.ctx.move_to(100, box_y + 18)
+            self.ctx.show_text(it["title"])
+
+            self.ctx.set_source_rgb(0.65, 0.65, 0.68)
+            self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            self.ctx.set_font_size(11)
+            self.ctx.move_to(100, box_y + 36)
+            exec_text = it["exec"] if len(it["exec"]) < 90 else it["exec"][:87] + "..."
+            self.ctx.show_text(exec_text)
+
+            y += 54
+        return y - start_y
+
+    def draw_tools_tab(self, y):
+        start_y = y
+        tools_groups = [
+            ("MDEON Tools", [
+                ("MDEON Appearance", "mdeon-appearance"),
+                ("MDEON Autostart Manager", "mdeon-autostart"),
+                ("MDEON Autostart Dry Run", "x-terminal-emulator -e mdeon-autostart --dry-run"),
+                ("Reload XDG Autostart Now", "mdeon-autostart --session"),
+            ]),
+            ("General Desktop Tools", [
+                ("Audio Mixer — pavucontrol", "pavucontrol"),
+                ("Network Manager", "nm-connection-editor"),
+                ("Bluetooth Manager", "blueman-manager"),
+                ("LXAppearance", "lxappearance"),
+                ("Qt5 Settings", "qt5ct"),
+                ("Qt6 Settings", "qt6ct"),
+                ("mdeon-panel Config", "mdeon-panel-config"),
+                ("Nwg Panel Config", "nwg-panel-config"),
+            ]),
+            ("X11 / XFWM Tools", [
+                ("XFWM4 Settings", "xfwm4-settings"),
+                ("XFWM4 Tweaks", "xfwm4-tweaks-settings"),
+                ("XFWM4 Workspace Settings", "xfwm4-workspace-settings"),
+                ("XFCE Keyboard Shortcuts", "xfce4-keyboard-settings"),
+                ("XFCE Display Settings", "xfce4-display-settings"),
+                ("ARandR Display Layout", "arandr"),
+            ]),
+            ("Wayland Tools", [
+                ("Display Settings — wdisplays", "wdisplays"),
+                ("Display Settings — nwg-displays", "nwg-displays"),
+            ])
+        ]
+
+        for title, tools in tools_groups:
+            self.ctx.set_source_rgb(0.38, 0.68, 0.93)
+            self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            self.ctx.set_font_size(13)
+            self.ctx.move_to(30, y + 16)
+            self.ctx.show_text(title)
+            y += 26
+
+            for idx, (label, cmd) in enumerate(tools):
+                col = idx % 2
+                bx = 30 + col * 370
+                by = y + (idx // 2) * 36
+                exe = cmd.split()[0]
+                if has(exe):
+                    def make_tool_cb(c):
+                        return lambda: run(c)
+                    self.draw_button(bx, by, 350, 28, label, make_tool_cb(cmd), f"tool_{title}_{idx}")
+
+            num_rows = math.ceil(len(tools) / 2)
+            y += num_rows * 36 + 18
+
+        return y - start_y
+
+    def _draw_color_modal(self):
+        # Backdrop
+        self.ctx.set_source_rgba(0, 0, 0, 0.6)
+        self.ctx.rectangle(0, 0, self.width, self.height)
+        self.ctx.fill()
+
+        mw, mh = 420, 280
+        mx = (self.width - mw) // 2
+        my = (self.height - mh) // 2
+
+        self.ctx.set_source_rgb(0.18, 0.18, 0.20)
+        self._round_rect(mx, my, mw, mh, 8)
+        self.ctx.fill()
+        self.ctx.set_source_rgb(0.35, 0.35, 0.40)
+        self.ctx.set_line_width(1)
+        self._round_rect(mx, my, mw, mh, 8)
+        self.ctx.stroke()
+
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        self.ctx.set_font_size(14)
+        self.ctx.set_source_rgb(1.0, 1.0, 1.0)
+        self.ctx.move_to(mx + 20, my + 30)
+        self.ctx.show_text("Select Color")
+
+        # Color Palette Swatches (6 columns x 4 rows)
+        for idx, col_hex in enumerate(self.PALETTE_COLORS):
+            row = idx // 6
+            col = idx % 6
+            bx = mx + 20 + col * 44
+            by = my + 50 + row * 34
+
+            self.ctx.set_source_rgb_raw(*hex_to_rgb(col_hex))
+            self._round_rect(bx, by, 36, 26, 4)
+            self.ctx.fill()
+
+            is_cur = (self.modal_temp_color.upper() == col_hex.upper())
+            self.ctx.set_source_rgb(*( (1, 1, 1) if is_cur else (0.3, 0.3, 0.35) ))
+            self.ctx.set_line_width(2 if is_cur else 1)
+            self._round_rect(bx, by, 36, 26, 4)
+            self.ctx.stroke()
+
+            def make_pal_cb(c):
+                def cb():
+                    self.modal_temp_color = c
+                    self.redraw()
+                return cb
+            self.interactive_rects.append((bx, by, 36, 26, make_pal_cb(col_hex), f"modal_pal_{idx}"))
+
+        # Current selection preview box
+        preview_y = my + 196
+        self.ctx.set_source_rgb_raw(*hex_to_rgb(self.modal_temp_color))
+        self._round_rect(mx + 20, preview_y, 70, 28, 4)
+        self.ctx.fill()
+        self.ctx.set_source_rgb(0.4, 0.4, 0.45)
+        self.ctx.set_line_width(1)
+        self._round_rect(mx + 20, preview_y, 70, 28, 4)
+        self.ctx.stroke()
+
+        # Hex code label
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        self.ctx.set_font_size(13)
+        self.ctx.set_source_rgb(0.9, 0.9, 0.9)
+        self.ctx.move_to(mx + 105, preview_y + 19)
+        self.ctx.show_text(self.modal_temp_color)
+
+        # Cancel & Select Buttons
+        def on_cancel():
+            self.modal_active = False
+            self.redraw()
+
+        def on_confirm():
+            self.form_values["FALLBACK_COLOR"] = self.modal_temp_color
+            self.modal_active = False
+            self.redraw()
+
+        self.draw_button(mx + mw - 190, my + mh - 44, 80, 28, "Cancel", on_cancel, "modal_cancel")
+        self.draw_button(mx + mw - 100, my + mh - 44, 80, 28, "Select", on_confirm, "modal_confirm", primary=True)
+
+    # ------------------------------------------------------------------
+    # Main Render Frame
+    # ------------------------------------------------------------------
+    def redraw(self):
+        self.interactive_rects = []
+
+        # Background
+        self.ctx.set_source_rgb(0.12, 0.12, 0.13)
+        self.ctx.paint()
+
+        # Header / Tabs Bar
+        self.ctx.set_source_rgb(0.18, 0.18, 0.20)
+        self.ctx.rectangle(0, 0, self.width, 46)
+        self.ctx.fill()
+        self.ctx.set_source_rgb(0.25, 0.25, 0.28)
+        self.ctx.move_to(0, 46)
+        self.ctx.line_to(self.width, 46)
+        self.ctx.stroke()
+
+        tab_gap = 10
+        tab_w = min(110, (self.width - 40 - (len(self.TABS) - 1) * tab_gap) / len(self.TABS))
+        tab_x = 20
+        for idx, tab_name in enumerate(self.TABS):
+            is_active = (self.active_tab == idx)
+            self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD if is_active else cairo.FONT_WEIGHT_NORMAL)
+            self.ctx.set_font_size(12)
+            ext = self.ctx.text_extents(tab_name)
+
+            if is_active:
+                self.ctx.set_source_rgb(0.21, 0.52, 0.89)
+                self.ctx.rectangle(tab_x, 43, tab_w, 3)
+                self.ctx.fill()
+                self.ctx.set_source_rgb(1.0, 1.0, 1.0)
+            else:
+                self.ctx.set_source_rgb(0.7, 0.7, 0.7)
+
+            self.ctx.move_to(tab_x + (tab_w - ext.width) / 2, 28)
+            self.ctx.show_text(tab_name)
+
+            def make_tab_cb(i):
+                def cb():
+                    self.active_tab = i
+                    self.scroll_y = 0
+                    self.scroll_x = 0
+                    self.focused_entry = None
+                    self.dropdown_popup = None
+                    self.redraw()
+                return cb
+
+            self.interactive_rects.append((tab_x, 0, tab_w, 46, make_tab_cb(idx), f"tab_{idx}"))
+            tab_x += tab_w + tab_gap
+
+        # Footer
+        footer_y = self.height - 52
+        self.ctx.set_source_rgb(0.15, 0.15, 0.17)
+        self.ctx.rectangle(0, footer_y, self.width, 52)
+        self.ctx.fill()
+        self.ctx.set_source_rgb(0.24, 0.24, 0.28)
+        self.ctx.move_to(0, footer_y)
+        self.ctx.line_to(self.width, footer_y)
+        self.ctx.stroke()
+
+        autostart_tab_x = 20 + self.TABS.index("Autostart") * (tab_w + tab_gap)
+        save_button_x = autostart_tab_x + (tab_w - 116) / 2
+
+        # Status text
+        self.ctx.set_source_rgb(0.75, 0.75, 0.78)
+        self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        self.ctx.set_font_size(12)
+        self.ctx.move_to(24, footer_y + 30)
+        status_text = self.status_msg
+        while self.ctx.text_extents(status_text).width > save_button_x - 40:
+            status_text = status_text[:-4] + "..."
+        self.ctx.show_text(status_text)
+
+        # Align the fixed action button with the Autostart tab above.
+        self.draw_button(save_button_x, footer_y + 11, 116, 30, "Save & Apply", lambda: self.save_settings(), "btn_save", primary=True)
+
+        # Content Area (with Clipping)
+        content_top = 60
+        horizontal_track_y = footer_y - 12
+        content_bottom = horizontal_track_y - 8
+        content_view_width = self.width - 18
+        content_view_height = content_bottom - content_top
+        content_rect_start = len(self.interactive_rects)
+        self.ctx.save()
+        self.ctx.rectangle(0, content_top, content_view_width, content_view_height)
+        self.ctx.clip()
+
+        self.ctx.save()
+        self.ctx.translate(-self.scroll_x, 0)
+        content_y = content_top - self.scroll_y
+        total_content_height = 0
+        if self.active_tab == 0:
+            total_content_height = self.draw_common_tab(content_y)
+        elif self.active_tab == 1:
+            total_content_height = self.draw_x11_tab(content_y)
+        elif self.active_tab == 2:
+            total_content_height = self.draw_wayland_tab(content_y)
+        elif self.active_tab == 3:
+            total_content_height = self.draw_autostart_tab(content_y)
+        elif self.active_tab == 4:
+            total_content_height = self.draw_tools_tab(content_y)
+        self.ctx.restore()
+        self.ctx.restore()
+
+        self.max_scroll_y = max(0, total_content_height - content_view_height)
+        content_widths = [700, 760, 760, self.width - 30, 750]
+        content_width = content_widths[self.active_tab]
+        self.max_scroll_x = max(0, content_width - content_view_width)
+        clamped_scroll_y = min(self.scroll_y, self.max_scroll_y)
+        clamped_scroll_x = min(self.scroll_x, self.max_scroll_x)
+        if clamped_scroll_y != self.scroll_y or clamped_scroll_x != self.scroll_x:
+            self.scroll_y = clamped_scroll_y
+            self.scroll_x = clamped_scroll_x
+            self.redraw()
+            return
+
+        # Keep hit targets aligned with the visible portion of clipped content.
+        for index in range(content_rect_start, len(self.interactive_rects)):
+            x, y, w, h, callback, hover_id = self.interactive_rects[index]
+            visible_left = max(x - self.scroll_x, 0)
+            visible_right = min(x - self.scroll_x + w, content_view_width)
+            visible_top = max(y, content_top)
+            visible_bottom = min(y + h, content_bottom)
+            if visible_right > visible_left and visible_bottom > visible_top:
+                self.interactive_rects[index] = (
+                    visible_left, visible_top, visible_right - visible_left,
+                    visible_bottom - visible_top, callback, hover_id
+                )
+            else:
+                self.interactive_rects[index] = (x, 0, 0, 0, callback, hover_id)
+
+        scrollbar_x = self.width - 12
+        scrollbar_y = content_top
+        scrollbar_w = 6
+        scrollbar_h = content_view_height
+        thumb_h = scrollbar_h
+        if total_content_height > content_view_height:
+            thumb_h = max(28, scrollbar_h * content_view_height / total_content_height)
+            thumb_h = min(scrollbar_h, thumb_h)
+        thumb_y = scrollbar_y
+        if self.max_scroll_y:
+            thumb_y += (scrollbar_h - thumb_h) * self.scroll_y / self.max_scroll_y
+        self.scrollbar = (scrollbar_x, scrollbar_y, scrollbar_w, scrollbar_h, thumb_y, thumb_h)
+
+        self.ctx.set_source_rgb(0.18, 0.18, 0.20)
+        self._round_rect(scrollbar_x, scrollbar_y, scrollbar_w, scrollbar_h, 3)
+        self.ctx.fill()
+        self.ctx.set_source_rgb(0.42, 0.42, 0.46)
+        self._round_rect(scrollbar_x, thumb_y, scrollbar_w, thumb_h, 3)
+        self.ctx.fill()
+
+        horizontal_track_x = 12
+        horizontal_track_w = self.width - 34
+        horizontal_track_h = 6
+        horizontal_thumb_w = horizontal_track_w
+        if content_width > content_view_width:
+            horizontal_thumb_w = max(
+                36, horizontal_track_w * content_view_width / content_width
+            )
+            horizontal_thumb_w = min(horizontal_track_w, horizontal_thumb_w)
+        horizontal_thumb_x = horizontal_track_x
+        if self.max_scroll_x:
+            horizontal_thumb_x += (
+                horizontal_track_w - horizontal_thumb_w
+            ) * self.scroll_x / self.max_scroll_x
+        self.horizontal_scrollbar = (
+            horizontal_track_x, horizontal_track_y, horizontal_track_w,
+            horizontal_track_h, horizontal_thumb_x, horizontal_thumb_w
+        )
+        self.ctx.set_source_rgb(0.18, 0.18, 0.20)
+        self._round_rect(horizontal_track_x, horizontal_track_y, horizontal_track_w, horizontal_track_h, 3)
+        self.ctx.fill()
+        self.ctx.set_source_rgb(0.42, 0.42, 0.46)
+        self._round_rect(horizontal_thumb_x, horizontal_track_y, horizontal_thumb_w, horizontal_track_h, 3)
+        self.ctx.fill()
+
+        # Dropdown Popup Overlay
+        if self.dropdown_popup:
+            px, py, pw, ph, items, callback = self.dropdown_popup
+            self.ctx.set_source_rgb(0.18, 0.18, 0.20)
+            self._round_rect(px, py, pw, ph, 4)
+            self.ctx.fill()
+            self.ctx.set_source_rgb(0.35, 0.35, 0.38)
+            self._round_rect(px, py, pw, ph, 4)
+            self.ctx.stroke()
+
+            item_h = 26
+            for idx, item in enumerate(items):
+                iy = py + 4 + idx * item_h
+                if iy + item_h > py + ph:
+                    break
+                is_item_hov = (self.hovered_id == f"pop_item_{idx}")
+                if is_item_hov:
+                    self.ctx.set_source_rgb(0.21, 0.52, 0.89)
+                    self._round_rect(px + 2, iy, pw - 4, item_h, 3)
+                    self.ctx.fill()
+                    self.ctx.set_source_rgb(1.0, 1.0, 1.0)
+                else:
+                    self.ctx.set_source_rgb(0.85, 0.85, 0.85)
+
+                self.ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+                self.ctx.set_font_size(12)
+                self.ctx.move_to(px + 10, iy + item_h / 2 + 4)
+                self.ctx.show_text(item)
+
+                def make_choice_cb(choice):
+                    return lambda: callback(choice)
+                self.interactive_rects.append((px + 2, iy, pw - 4, item_h, make_choice_cb(item), f"pop_item_{idx}"))
+
+        # Color Modal Overlay
+        if self.modal_active:
+            self._draw_color_modal()
+
+        self.surface.flush()
+        self.flush_cb()
+
+    # ------------------------------------------------------------------
+    # User Input & Event Handlers
+    # ------------------------------------------------------------------
+    def handle_click(self, x, y, button):
+        if button == 1:
+            if self.scrollbar:
+                sx, sy, sw, sh, thumb_y, thumb_h = self.scrollbar
+                if sx <= x <= sx + sw and sy <= y <= sy + sh and self.max_scroll_y:
+                    if thumb_y <= y <= thumb_y + thumb_h:
+                        self.scrollbar_dragging = True
+                        self.scrollbar_drag_offset = y - thumb_y
+                    else:
+                        self.scrollbar_drag_offset = thumb_h / 2
+                        self._scroll_to_thumb(y)
+                    return
+            if self.horizontal_scrollbar:
+                sx, sy, sw, sh, thumb_x, thumb_w = self.horizontal_scrollbar
+                if sx <= x <= sx + sw and sy <= y <= sy + sh and self.max_scroll_x:
+                    if thumb_x <= x <= thumb_x + thumb_w:
+                        self.horizontal_scrollbar_dragging = True
+                        self.horizontal_scrollbar_drag_offset = x - thumb_x
+                    else:
+                        self.horizontal_scrollbar_drag_offset = thumb_w / 2
+                        self._scroll_to_horizontal_thumb(x)
+                    return
+            for rx, ry, rw, rh, cb, _ in reversed(self.interactive_rects):
+                if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                    cb()
+                    return
+            if self.dropdown_popup:
+                self.dropdown_popup = None
+                self.redraw()
+            self.focused_entry = None
+            self.redraw()
+        elif button == 4:  # Scroll Up
+            self.scroll_y = max(0, self.scroll_y - 36)
+            self.redraw()
+        elif button == 5:  # Scroll Down
+            self.scroll_y = min(self.max_scroll_y, self.scroll_y + 36)
+            self.redraw()
+
+    def handle_motion(self, x, y):
+        if self.scrollbar_dragging:
+            self._scroll_to_thumb(y)
+            return
+        if self.horizontal_scrollbar_dragging:
+            self._scroll_to_horizontal_thumb(x)
+            return
+        prev_hover = self.hovered_id
+        self.hovered_id = None
+        for rx, ry, rw, rh, _, hid in self.interactive_rects:
+            if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                self.hovered_id = hid
+                break
+        if prev_hover != self.hovered_id:
+            self.redraw()
+
+    def handle_button_release(self, button):
+        if button == 1:
+            self.scrollbar_dragging = False
+            self.horizontal_scrollbar_dragging = False
+
+    def _scroll_to_thumb(self, pointer_y):
+        if not self.scrollbar or not self.max_scroll_y:
+            return
+        _, track_y, _, track_h, _, thumb_h = self.scrollbar
+        travel = track_h - thumb_h
+        if travel <= 0:
+            return
+        thumb_top = min(max(pointer_y - self.scrollbar_drag_offset, track_y), track_y + travel)
+        self.scroll_y = round((thumb_top - track_y) / travel * self.max_scroll_y)
+        self.redraw()
+
+    def _scroll_to_horizontal_thumb(self, pointer_x):
+        if not self.horizontal_scrollbar or not self.max_scroll_x:
+            return
+        track_x, _, track_w, _, _, thumb_w = self.horizontal_scrollbar
+        travel = track_w - thumb_w
+        if travel <= 0:
+            return
+        thumb_left = min(
+            max(pointer_x - self.horizontal_scrollbar_drag_offset, track_x),
+            track_x + travel
+        )
+        self.scroll_x = round((thumb_left - track_x) / travel * self.max_scroll_x)
+        self.redraw()
+
+    def handle_key(self, keysym, string_val=""):
+        if not self.focused_entry:
+            return
+
+        curr = str(self.form_values.get(self.focused_entry, ""))
+        if keysym == 0xff08:  # Backspace
+            if curr:
+                self.form_values[self.focused_entry] = curr[:-1]
+                self.redraw()
+        elif keysym in (0xff0d, 0xff1b):  # Enter or Escape
+            self.focused_entry = None
+            self.redraw()
+        else:
+            if string_val and string_val.isprintable():
+                self.form_values[self.focused_entry] = curr + string_val
+                self.redraw()
+
+
+# ----------------------------------------------------------------------
+# X11 Window Runner
+# ----------------------------------------------------------------------
+def run_x11():
+    if not HAVE_X11:
+        raise RuntimeError("libX11 not found on system.")
+
+    logger.info("Starting MDEON Settings in X11 Mode...")
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise RuntimeError("Unable to open X11 Display.")
+
+    screen = x11.XDefaultScreen(display)
+    root = x11.XRootWindow(display, screen)
+    visual = x11.XDefaultVisual(display, screen)
+    depth = x11.XDefaultDepth(display, screen)
+
+    screen_width = x11.XDisplayWidth(display, screen)
+    screen_height = x11.XDisplayHeight(display, screen)
+    width = max(520, min(780, screen_width - 40))
+    height = max(300, min(600, screen_height - 70))
+    win = x11.XCreateSimpleWindow(display, root, 20, 20, width, height, 0, 0, 0x1e1e1e)
+    gc = x11.XCreateGC(display, win, 0, None)
+
+    # Window Titles & Properties
+    x11.XStoreName(display, win, b"MDEON Settings")
+    atom_class = x11.XInternAtom(display, b"WM_CLASS", 0)
+    x11.XChangeProperty(display, win, atom_class, 31, 8, 0, b"mdeon-settings\0mdeon-settings\0", 30)
+
+    atom_type = x11.XInternAtom(display, b"_NET_WM_WINDOW_TYPE", 0)
+    atom_normal = x11.XInternAtom(display, b"_NET_WM_WINDOW_TYPE_NORMAL", 0)
+    x11.XChangeProperty(display, win, atom_type, 4, 32, 0, (ctypes.c_ulong * 1)(atom_normal), 1)
+
+    # Intercept WM_DELETE_WINDOW protocol
+    atom_protocols = x11.XInternAtom(display, b"WM_PROTOCOLS", 0)
+    atom_delete = x11.XInternAtom(display, b"WM_DELETE_WINDOW", 0)
+    x11.XChangeProperty(display, win, atom_protocols, 4, 32, 0, (ctypes.c_ulong * 1)(atom_delete), 1)
+
+    # Listen to inputs: Exposure, KeyPress, ButtonPress, PointerMotion, StructureNotify
+    x11.XSelectInput(display, win, (1 << 0) | (1 << 15) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 13) | (1 << 17))
+    x11.XMapWindow(display, win)
+    x11.XFlush(display)
+
+    app = None
+    def flush():
+        x11.XPutImage(display, win, gc, app.ximage, 0, 0, 0, 0, width, height)
+        x11.XFlush(display)
+
+    app = MdeonSettingsCairo(width, height, flush)
+    c_data = (ctypes.c_char * (app.stride * height)).from_buffer(app.data_buffer)
+    app.ximage = x11.XCreateImage(display, visual, depth, 2, 0, ctypes.addressof(c_data), width, height, 32, app.stride)
+
+    def replace_backing_image(new_width, new_height):
+        nonlocal width, height, c_data
+        min_width, min_height = 520, 300
+        new_width = max(min_width, new_width)
+        new_height = max(min_height, new_height)
+        if (new_width, new_height) == (width, height):
+            return
+
+        if new_width != width or new_height != height:
+            image_data = ctypes.cast(app.ximage, ctypes.POINTER(XImageData)).contents
+            destroy_image = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)(image_data.funcs.destroy_image)
+            image_data.data = None
+            destroy_image(app.ximage)
+
+        width, height = new_width, new_height
+        app.width, app.height = width, height
+        app._init_cairo()
+        c_data = (ctypes.c_char * (app.stride * height)).from_buffer(app.data_buffer)
+        app.ximage = x11.XCreateImage(
+            display, visual, depth, 2, 0, ctypes.addressof(c_data), width, height, 32, app.stride
+        )
+        app.redraw()
+
+    app.redraw()
+    ev = XEvent()
+
+    running = True
+    while running:
+        while x11.XPending(display):
+            x11.XNextEvent(display, ctypes.byref(ev))
+            if ev.type == 12:  # Expose
+                app.redraw()
+            elif ev.type == 6:  # MotionNotify
+                mev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XMotionEvent)).contents
+                app.handle_motion(mev.x, mev.y)
+            elif ev.type == 4:  # ButtonPress
+                bev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XButtonEvent)).contents
+                app.handle_click(bev.x, bev.y, bev.button)
+            elif ev.type == 5:  # ButtonRelease
+                bev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XButtonEvent)).contents
+                app.handle_button_release(bev.button)
+            elif ev.type == 22:  # ConfigureNotify
+                cev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XConfigureEvent)).contents
+                if cev.width < 520 or cev.height < 300:
+                    x11.XResizeWindow(display, win, max(520, cev.width), max(300, cev.height))
+                    x11.XFlush(display)
+                else:
+                    replace_backing_image(cev.width, cev.height)
+            elif ev.type == 2:  # KeyPress
+                kev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XKeyEvent)).contents
+                keysym = x11.XKeycodeToKeysym(display, kev.keycode, 0)
+                str_buf = ctypes.create_string_buffer(32)
+                n = x11.XLookupString(ctypes.byref(kev), str_buf, 32, None, None)
+                text_val = str_buf.value.decode("utf-8", "ignore") if n > 0 else ""
+                app.handle_key(keysym, text_val)
+            elif ev.type == 33:  # ClientMessage (Close Window event)
+                cmev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XClientMessageEvent)).contents
+                if cmev.message_type == atom_protocols and cmev.data[0] == atom_delete:
+                    running = False
+                    break
+        time.sleep(0.015)
+
+    x11.XDestroyWindow(display, win)
+    x11.XCloseDisplay(display)
+
+
+# ----------------------------------------------------------------------
+# Application Entrypoint
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        if SESSION_TYPE == "wayland" and os.environ.get("WAYLAND_DISPLAY"):
+            logger.info("Starting MDEON Settings in Wayland Mode...")
+            try:
+                run_cairo_gtk(MdeonSettingsCairo, "MDEON Settings", 780, 600, 520, 300)
+            except Exception as e:
+                if not os.environ.get("DISPLAY"):
+                    raise
+                logger.warning("Wayland window startup failed (%s); falling back to X11.", e)
+                run_x11()
+        elif os.environ.get("DISPLAY"):
+            run_x11()
+        else:
+            raise RuntimeError("No graphical display available (Wayland or X11).")
+    except KeyboardInterrupt:
+        logger.info("MDEON Settings cleanly terminated.")
+    except Exception as e:
+        logger.error(f"Execution failed: {e}")

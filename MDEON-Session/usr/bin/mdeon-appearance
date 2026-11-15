@@ -1,0 +1,1846 @@
+#!/usr/bin/env python3
+"""
+MDEON Appearance (Zero-Toolkit Edition)
+- Rendering: Pure PyCairo (Zero GTK/Qt GUI widgets)
+- Windowing: Native X11 / Xwayland with direct CTypes bindings
+- Feature Complete: GTK2, GTK3, GTK4 (including sound themes, middle click paste,
+  text scaling factor, event feedback sounds, button layout, and kinetic scroll)
+- Interactive Cairo Draggable Right Scrollbar
+"""
+
+import os
+import sys
+import time
+import math
+import shutil
+import ctypes
+import logging
+import warnings
+import subprocess
+import configparser
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import cairo
+from mdeon_theme import ThemedContext, prefers_light_scheme
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+try:
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio
+    HAVE_GIO = True
+except Exception:
+    HAVE_GIO = False
+
+logging.basicConfig(
+    level=logging.DEBUG if os.environ.get("MDEON_DEBUG") == "1" else logging.INFO,
+    format="[MDEON-APPEARANCE] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger("mdeon-appearance")
+
+APP_ID = "org.mdeon.Appearance"
+APP_NAME = "MDEON Appearance"
+PROCESS_NAME = "mdeon-appearance"
+MDEON_CONFIG_DIR = os.path.expanduser("~/.config/mdeon")
+MDEON_APPEARANCE_CONF = os.path.join(MDEON_CONFIG_DIR, "appearance.conf")
+
+
+# ----------------------------------------------------------------------
+# Process Identity
+# ----------------------------------------------------------------------
+def set_process_name(name=PROCESS_NAME):
+    sys.argv[0] = name
+    try:
+        libc = ctypes.cdll.LoadLibrary("libc.so.6")
+        libc.prctl(15, name.encode("utf-8"), 0, 0, 0)
+    except Exception:
+        pass
+    try:
+        import setproctitle
+        setproctitle.setproctitle(name)
+    except ImportError:
+        pass
+
+set_process_name(PROCESS_NAME)
+
+
+# ----------------------------------------------------------------------
+# Helper Utilities
+# ----------------------------------------------------------------------
+def command_exists(command):
+    return subprocess.run(
+        ["which", command],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    ).returncode == 0
+
+
+def safe_read_lines(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.readlines()
+    except OSError:
+        return []
+
+
+def safe_write_lines(path, lines):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+def sanitize_config_value(value):
+    if value is None:
+        return ""
+    value = str(value)
+    value = value.replace("\x00", "")
+    value = value.replace("\r", " ")
+    value = value.replace("\n", " ")
+    return value.strip()
+
+
+def parse_font_string(font_string):
+    font_string = str(font_string or "Sans 11").strip()
+    parts = font_string.rsplit(" ", 1)
+    if len(parts) == 2:
+        try:
+            size = float(parts[1])
+            return parts[0], size
+        except ValueError:
+            pass
+    return font_string or "Sans", 11.0
+
+
+def make_settings(schema_id):
+    if not HAVE_GIO:
+        return None
+    try:
+        source = Gio.SettingsSchemaSource.get_default()
+        if source and source.lookup(schema_id, True):
+            return Gio.Settings.new(schema_id)
+    except Exception:
+        pass
+    return None
+
+
+# ----------------------------------------------------------------------
+# Theme Backend Engine (Comprehensive GTK4 & XDG Spec)
+# ----------------------------------------------------------------------
+class ThemeBackend:
+    def __init__(self):
+        self.gsettings = make_settings("org.gnome.desktop.interface")
+        self.wm_settings = make_settings("org.gnome.desktop.wm.preferences")
+        self.sound_settings = make_settings("org.gnome.desktop.sound")
+
+    def detect_wayfire_config(self):
+        env_path = os.environ.get("WAYFIRE_CONFIG_FILE")
+        if env_path and os.path.exists(env_path):
+            return env_path
+        xdg_config = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+        standard_path = os.path.join(xdg_config, "wayfire.ini")
+        if os.path.exists(standard_path):
+            return standard_path
+        return os.path.expanduser("~/.config/wayfire.ini")
+
+    def detect_labwc_config(self):
+        xdg_config = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+        standard_path = os.path.join(xdg_config, "labwc", "rc.xml")
+        if os.path.exists(standard_path):
+            return standard_path
+        return os.path.expanduser("~/.config/labwc/rc.xml")
+
+    def get_data_dirs(self):
+        dirs = [os.path.expanduser("~/.local/share")]
+        xdg_data_dirs = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+        for item in xdg_data_dirs.split(":"):
+            item = item.strip()
+            if item:
+                dirs.append(item)
+        dirs.append("/run/host/usr/share")
+        clean = []
+        for d in dirs:
+            if d and d not in clean:
+                clean.append(d)
+        return clean
+
+    def get_directories(self, subfolder):
+        dirs = [
+            os.path.expanduser(f"~/.{subfolder}"),
+            os.path.expanduser(f"~/.local/share/{subfolder}"),
+        ]
+        for data_dir in self.get_data_dirs():
+            dirs.append(os.path.join(data_dir, subfolder))
+        clean = []
+        for directory in dirs:
+            if directory and os.path.exists(directory) and directory not in clean:
+                clean.append(directory)
+        return clean
+
+    def get_gsetting_string(self, key, default=""):
+        if not self.gsettings:
+            return default
+        try:
+            return self.gsettings.get_string(key)
+        except Exception:
+            return default
+
+    def get_gsetting_int(self, key, default=0):
+        if not self.gsettings:
+            return default
+        try:
+            return self.gsettings.get_int(key)
+        except Exception:
+            return default
+
+    def get_gsetting_bool(self, key, default=False):
+        if not self.gsettings:
+            return default
+        try:
+            return self.gsettings.get_boolean(key)
+        except Exception:
+            return default
+
+    def get_gsetting_double(self, key, default=1.0):
+        if not self.gsettings:
+            return default
+        try:
+            return self.gsettings.get_double(key)
+        except Exception:
+            return default
+
+    def read_gtk_settings_file(self, version):
+        path = os.path.expanduser(f"~/.config/gtk-{version}/settings.ini")
+        config = configparser.ConfigParser()
+        try:
+            config.read(path)
+        except Exception:
+            return {}
+        if not config.has_section("Settings"):
+            return {}
+        return dict(config.items("Settings"))
+
+    def get_current_button_layout(self):
+        if self.wm_settings:
+            try:
+                return self.wm_settings.get_string("button-layout")
+            except Exception:
+                pass
+        gtk4 = self.read_gtk_settings_file("4.0")
+        return gtk4.get("gtk-decoration-layout", "appmenu:minimize,maximize,close")
+
+    def get_current_wm_theme(self):
+        if self.wm_settings:
+            try:
+                return self.wm_settings.get_string("theme")
+            except Exception:
+                pass
+        return ""
+
+    def get_current_gtk_theme(self):
+        val = self.get_gsetting_string("gtk-theme", "")
+        if val:
+            return val
+        gtk4 = self.read_gtk_settings_file("4.0")
+        return gtk4.get("gtk-theme-name", "Adwaita")
+
+    def get_current_icon_theme(self):
+        val = self.get_gsetting_string("icon-theme", "")
+        if val:
+            return val
+        gtk4 = self.read_gtk_settings_file("4.0")
+        return gtk4.get("gtk-icon-theme-name", "Adwaita")
+
+    def get_current_cursor_theme(self):
+        val = self.get_gsetting_string("cursor-theme", "")
+        if val:
+            return val
+        gtk4 = self.read_gtk_settings_file("4.0")
+        return gtk4.get("gtk-cursor-theme-name", "Adwaita")
+
+    def get_current_cursor_size(self):
+        val = self.get_gsetting_int("cursor-size", 0)
+        if val > 0:
+            return val
+        gtk4 = self.read_gtk_settings_file("4.0")
+        try:
+            return int(gtk4.get("gtk-cursor-theme-size", "24"))
+        except ValueError:
+            return 24
+
+    def get_current_font_name(self):
+        val = self.get_gsetting_string("font-name", "")
+        if val:
+            return val
+        gtk4 = self.read_gtk_settings_file("4.0")
+        return gtk4.get("gtk-font-name", "Sans 11")
+
+    def get_current_color_scheme(self):
+        val = self.get_gsetting_string("color-scheme", "")
+        if val:
+            return val
+        gtk4 = self.read_gtk_settings_file("4.0")
+        dark = gtk4.get("gtk-application-prefer-dark-theme", "0")
+        if dark in ("1", "true", "True"):
+            return "prefer-dark"
+        return "default"
+
+    def get_current_sound_theme(self):
+        if self.sound_settings:
+            try:
+                return self.sound_settings.get_string("theme-name")
+            except Exception:
+                pass
+        gtk4 = self.read_gtk_settings_file("4.0")
+        return gtk4.get("gtk-sound-theme-name", "freedesktop")
+
+    def get_current_event_sounds(self):
+        if self.sound_settings:
+            try:
+                return self.sound_settings.get_boolean("event-sounds")
+            except Exception:
+                pass
+        gtk4 = self.read_gtk_settings_file("4.0")
+        return gtk4.get("gtk-enable-event-sounds", "1") in ("1", "true", "True")
+
+    def get_current_middle_click_paste(self):
+        gtk4 = self.read_gtk_settings_file("4.0")
+        return gtk4.get("gtk-enable-primary-paste", "1") in ("1", "true", "True")
+
+    def get_current_text_scaling(self):
+        val = self.get_gsetting_double("text-scaling-factor", 1.0)
+        if val > 0.1:
+            return round(val, 2)
+        return 1.0
+
+    def get_gtk_themes(self):
+        themes = set()
+        for directory in self.get_directories("themes"):
+            try:
+                for theme_name in os.listdir(directory):
+                    theme_path = os.path.join(directory, theme_name)
+                    if not os.path.isdir(theme_path):
+                        continue
+                    markers = ["gtk-4.0", "gtk-3.0", "gtk-2.0", "metacity-1", "xfwm4", "openbox-3"]
+                    if any(os.path.exists(os.path.join(theme_path, m)) for m in markers):
+                        themes.add(theme_name)
+            except Exception:
+                pass
+        if not themes:
+            themes.update(["Adwaita", "Adwaita-dark", "HighContrast"])
+        return sorted(themes)
+
+    def get_icons_and_cursors(self):
+        icons, cursors = set(), set()
+        for base_dir in self.get_directories("icons"):
+            try:
+                for item in os.listdir(base_dir):
+                    path = os.path.join(base_dir, item)
+                    if not os.path.isdir(path):
+                        continue
+                    has_cursors = os.path.exists(os.path.join(path, "cursors"))
+                    has_index = os.path.exists(os.path.join(path, "index.theme"))
+                    if has_cursors:
+                        cursors.add(item)
+                    if has_index or not has_cursors:
+                        icons.add(item)
+            except Exception:
+                pass
+        if not icons:
+            icons.update(["Adwaita", "hicolor"])
+        if not cursors:
+            cursors.update(["Adwaita"])
+        return sorted(icons), sorted(cursors)
+
+    def get_sound_themes(self):
+        sounds = set()
+        for base_dir in self.get_directories("sounds"):
+            try:
+                for item in os.listdir(base_dir):
+                    path = os.path.join(base_dir, item)
+                    if os.path.isdir(path) and os.path.exists(os.path.join(path, "index.theme")):
+                        sounds.add(item)
+            except Exception:
+                pass
+        if not sounds:
+            sounds.add("freedesktop")
+        return sorted(sounds)
+
+    def get_system_fonts(self):
+        try:
+            output = subprocess.check_output(
+                ["fc-list", ":", "family"], text=True, stderr=subprocess.DEVNULL
+            )
+            fonts = set()
+            for line in output.splitlines():
+                primary = line.split(",")[0].strip()
+                if primary and not primary.startswith("@"):
+                    fonts.add(primary)
+            if fonts:
+                return sorted(fonts)
+        except Exception:
+            pass
+        return ["Sans", "Serif", "Monospace", "Cantarell", "Noto Sans"]
+
+    def is_qt_forced(self):
+        targets = [
+            os.path.expanduser("~/.profile"),
+            os.path.expanduser("~/.config/environment.d/mdeon-appearance.conf"),
+        ]
+        for path in targets:
+            for line in safe_read_lines(path):
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                if "QT_QPA_PLATFORMTHEME" in stripped and "gtk3" in stripped:
+                    return True
+        return False
+
+    def apply_qt_env(self, enable):
+        profile_path = os.path.expanduser("~/.profile")
+        target_line = 'export QT_QPA_PLATFORMTHEME="gtk3"\n'
+        lines = safe_read_lines(profile_path)
+        new_lines = [line for line in lines if "QT_QPA_PLATFORMTHEME" not in line]
+        if enable:
+            if new_lines and not new_lines[-1].endswith("\n"):
+                new_lines[-1] += "\n"
+            new_lines.append(target_line)
+        safe_write_lines(profile_path, new_lines)
+
+        env_dir = os.path.expanduser("~/.config/environment.d")
+        env_file = os.path.join(env_dir, "mdeon-appearance.conf")
+        os.makedirs(env_dir, exist_ok=True)
+        if enable:
+            safe_write_lines(env_file, ['QT_QPA_PLATFORMTHEME=gtk3\n'])
+        else:
+            try:
+                os.remove(env_file)
+            except OSError:
+                pass
+
+    def apply_flatpak_overrides(self, gtk_theme, icon_theme, cursor_theme, cursor_size):
+        if not command_exists("flatpak"):
+            return
+        subprocess.run(
+            [
+                "flatpak", "override", "--user",
+                "--filesystem=~/.themes:ro",
+                "--filesystem=~/.icons:ro",
+                "--filesystem=~/.local/share/themes:ro",
+                "--filesystem=~/.local/share/icons:ro",
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        subprocess.run(
+            [
+                "flatpak", "override", "--user",
+                f"--env=GTK_THEME={gtk_theme}",
+                f"--env=ICON_THEME={icon_theme}",
+                f"--env=XCURSOR_THEME={cursor_theme}",
+                f"--env=XCURSOR_SIZE={int(cursor_size)}",
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    def apply_live_desktop_gsettings(
+        self, gtk_theme, wm_theme, icon_theme, cursor_theme, cursor_size,
+        font, color_scheme, button_layout, sound_theme, event_sounds, text_scaling
+    ):
+        if self.gsettings:
+            for key, val in [
+                ("gtk-theme", gtk_theme),
+                ("icon-theme", icon_theme),
+                ("cursor-theme", cursor_theme),
+                ("font-name", font),
+                ("color-scheme", color_scheme),
+            ]:
+                try:
+                    self.gsettings.set_string(key, val)
+                except Exception:
+                    pass
+            try:
+                self.gsettings.set_int("cursor-size", int(cursor_size))
+                self.gsettings.set_double("text-scaling-factor", float(text_scaling))
+            except Exception:
+                pass
+
+        if self.sound_settings:
+            try:
+                self.sound_settings.set_string("theme-name", sound_theme)
+                self.sound_settings.set_boolean("event-sounds", bool(event_sounds))
+                self.sound_settings.set_boolean("input-feedback-sounds", bool(event_sounds))
+            except Exception:
+                pass
+
+        if self.wm_settings:
+            try:
+                self.wm_settings.set_string("button-layout", button_layout)
+            except Exception:
+                pass
+            if wm_theme:
+                try:
+                    self.wm_settings.set_string("theme", wm_theme)
+                except Exception:
+                    pass
+
+    def commit_gtk3_gtk4_files(
+        self, gtk_theme, icon_theme, cursor_theme, cursor_size, font,
+        button_layout, color_scheme, sound_theme, event_sounds, middle_click_paste
+    ):
+        for version in ["3.0", "4.0"]:
+            config_dir = os.path.expanduser(f"~/.config/gtk-{version}")
+            os.makedirs(config_dir, exist_ok=True)
+            config_file = os.path.join(config_dir, "settings.ini")
+            config = configparser.ConfigParser()
+            if os.path.exists(config_file):
+                try:
+                    config.read(config_file)
+                except Exception:
+                    pass
+            if not config.has_section("Settings"):
+                config.add_section("Settings")
+            prefer_dark = "1" if color_scheme == "prefer-dark" else "0"
+            config.set("Settings", "gtk-theme-name", str(gtk_theme))
+            config.set("Settings", "gtk-icon-theme-name", str(icon_theme))
+            config.set("Settings", "gtk-cursor-theme-name", str(cursor_theme))
+            config.set("Settings", "gtk-cursor-theme-size", str(int(cursor_size)))
+            config.set("Settings", "gtk-font-name", str(font))
+            config.set("Settings", "gtk-decoration-layout", str(button_layout))
+            config.set("Settings", "gtk-application-prefer-dark-theme", str(prefer_dark))
+            config.set("Settings", "gtk-sound-theme-name", str(sound_theme))
+            config.set("Settings", "gtk-enable-event-sounds", "1" if event_sounds else "0")
+            config.set("Settings", "gtk-enable-input-feedback-sounds", "1" if event_sounds else "0")
+            config.set("Settings", "gtk-enable-primary-paste", "1" if middle_click_paste else "0")
+
+            with open(config_file, "w", encoding="utf-8") as f:
+                config.write(f)
+
+    def commit_gtk2_file(self, gtk_theme, icon_theme, cursor_theme, cursor_size, font, color_scheme, event_sounds):
+        gtkrc_path = os.path.expanduser("~/.gtkrc-2.0")
+        prefer_dark = "1" if color_scheme == "prefer-dark" else "0"
+        lines = [
+            "# Written by MDEON Appearance\n",
+            f'gtk-theme-name="{gtk_theme}"\n',
+            f'gtk-icon-theme-name="{icon_theme}"\n',
+            f'gtk-cursor-theme-name="{cursor_theme}"\n',
+            f"gtk-cursor-theme-size={int(cursor_size)}\n",
+            f'gtk-font-name="{font}"\n',
+            f"gtk-application-prefer-dark-theme={prefer_dark}\n",
+            f'gtk-enable-event-sounds={"1" if event_sounds else "0"}\n',
+        ]
+        safe_write_lines(gtkrc_path, lines)
+
+    def commit_cursor_default(self, cursor_theme):
+        icon_dir = os.path.expanduser("~/.icons/default")
+        os.makedirs(icon_dir, exist_ok=True)
+        safe_write_lines(os.path.join(icon_dir, "index.theme"), ["[Icon Theme]\n", f"Inherits={cursor_theme}\n"])
+
+    def commit_xresources_cursor(self, cursor_theme, cursor_size):
+        path = os.path.expanduser("~/.Xresources")
+        lines = safe_read_lines(path)
+        filtered = [
+            l for l in lines
+            if not l.strip().startswith("Xcursor.theme:") and not l.strip().startswith("Xcursor.size:")
+        ]
+        if filtered and not filtered[-1].endswith("\n"):
+            filtered[-1] += "\n"
+        filtered.append(f"Xcursor.theme: {cursor_theme}\n")
+        filtered.append(f"Xcursor.size: {int(cursor_size)}\n")
+        safe_write_lines(path, filtered)
+        if command_exists("xrdb"):
+            subprocess.run(["xrdb", "-merge", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def commit_mdeon_config(self, **kwargs):
+        os.makedirs(MDEON_CONFIG_DIR, exist_ok=True)
+        lines = ["# Written by MDEON Appearance\n"]
+        for k, v in kwargs.items():
+            lines.append(f'{k.upper()}="{sanitize_config_value(v)}"\n')
+        safe_write_lines(MDEON_APPEARANCE_CONF, lines)
+
+    def apply_xsettingsd(self, gtk_theme, icon_theme, cursor_theme, cursor_size, font, color_scheme, sound_theme, event_sounds):
+        if not command_exists("xsettingsd"):
+            return
+        xset_conf = os.path.expanduser("~/.xsettingsd")
+        prefer_dark = 1 if color_scheme == "prefer-dark" else 0
+        lines = [
+            "# Written by MDEON Appearance\n",
+            f'Net/ThemeName "{gtk_theme}"\n',
+            f'Net/IconThemeName "{icon_theme}"\n',
+            f'Gtk/CursorThemeName "{cursor_theme}"\n',
+            f"Gtk/CursorThemeSize {int(cursor_size)}\n",
+            f'Gtk/FontName "{font}"\n',
+            f"Gtk/ApplicationPreferDarkTheme {prefer_dark}\n",
+            f'Net/SoundThemeName "{sound_theme}"\n',
+            f"Net/EnableEventSounds {1 if event_sounds else 0}\n",
+            f"Net/EnableInputFeedbackSounds {1 if event_sounds else 0}\n",
+        ]
+        safe_write_lines(xset_conf, lines)
+        subprocess.run(["killall", "-HUP", "xsettingsd"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def apply_wm_specific_configs(self, gtk_theme, button_layout):
+        self.apply_wayfire_config(button_layout)
+        self.apply_labwc_config(gtk_theme, button_layout)
+
+    def apply_wayfire_config(self, button_layout):
+        wayfire_conf = self.detect_wayfire_config()
+        if not wayfire_conf:
+            return
+        directory = os.path.dirname(wayfire_conf)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        config = configparser.ConfigParser()
+        try:
+            if os.path.exists(wayfire_conf):
+                config.read(wayfire_conf)
+            if not config.has_section("decoration"):
+                config.add_section("decoration")
+            if button_layout.startswith("close"):
+                wf_layout = "close minimize maximize"
+            elif button_layout == "appmenu:close":
+                wf_layout = "close"
+            else:
+                wf_layout = "minimize maximize close"
+            config.set("decoration", "button_order", wf_layout)
+            config.set("decoration", "title_align", "center")
+            with open(wayfire_conf, "w", encoding="utf-8") as f:
+                config.write(f)
+        except Exception:
+            pass
+
+    def apply_labwc_config(self, gtk_theme, button_layout):
+        labwc_conf = self.detect_labwc_config()
+        labwc_dir = os.path.dirname(labwc_conf)
+        if labwc_dir:
+            os.makedirs(labwc_dir, exist_ok=True)
+        try:
+            if os.path.exists(labwc_conf):
+                tree = ET.parse(labwc_conf)
+                root = tree.getroot()
+            else:
+                root = ET.Element("openbox_config")
+                tree = ET.ElementTree(root)
+
+            lb_layout = "NLIMC"
+            if button_layout.startswith("close,minimize,maximize"):
+                lb_layout = "CMILN"
+            elif button_layout == "appmenu:close":
+                lb_layout = "NLC"
+            elif button_layout == "close:appmenu":
+                lb_layout = "CLN"
+
+            theme_tag = root.find("theme")
+            if theme_tag is None:
+                theme_tag = ET.SubElement(root, "theme")
+            name_tag = theme_tag.find("name")
+            if name_tag is None:
+                name_tag = ET.SubElement(theme_tag, "name")
+            name_tag.text = gtk_theme
+
+            core_tag = root.find("core")
+            if core_tag is None:
+                core_tag = ET.SubElement(root, "core")
+            titlebar_tag = core_tag.find("titlebar")
+            if titlebar_tag is None:
+                titlebar_tag = ET.SubElement(core_tag, "titlebar")
+            layout_tag = titlebar_tag.find("layout")
+            if layout_tag is None:
+                layout_tag = ET.SubElement(titlebar_tag, "layout")
+            layout_tag.text = lb_layout
+
+            tree.write(labwc_conf, encoding="utf-8", xml_declaration=True)
+            subprocess.run(["labwc", "-r"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------
+# Core Cairo UI Engine
+# ----------------------------------------------------------------------
+class MdeonAppearanceCore:
+    def __init__(self, width, height, flush_cb):
+        self.width = width
+        self.height = height
+        self.flush_cb = flush_cb
+
+        self.backend = ThemeBackend()
+
+        self.layouts = {
+            "Right, standard": "appmenu:minimize,maximize,close",
+            "Left, macOS style": "close,minimize,maximize:appmenu",
+            "Right, close only": "appmenu:close",
+            "Left, close only": "close:appmenu",
+        }
+
+        self.color_schemes = {
+            "System default": "default",
+            "Prefer light": "prefer-light",
+            "Prefer dark": "prefer-dark",
+        }
+
+        self.is_applied = False
+        self.is_updating = False
+
+        self.gtk_themes = self.backend.get_gtk_themes()
+        self.icon_themes, self.cursor_themes = self.backend.get_icons_and_cursors()
+        self.sound_themes = self.backend.get_sound_themes()
+        self.fonts = self.backend.get_system_fonts()
+
+        self.capture_system_snapshot()
+
+        # State Models
+        self.selected_color_scheme = next(
+            (k for k, v in self.color_schemes.items() if v == self.initial_snapshot["color_scheme"]),
+            "System default"
+        )
+        self.selected_gtk_theme = self.initial_snapshot["gtk_theme"]
+        self.selected_wm_theme = self.initial_snapshot["wm_theme"] or self.initial_snapshot["gtk_theme"]
+        self.selected_icon_theme = self.initial_snapshot["icon_theme"]
+        self.selected_cursor_theme = self.initial_snapshot["cursor_theme"]
+        self.selected_cursor_size = int(self.initial_snapshot["cursor_size"])
+
+        cur_font, cur_size = parse_font_string(self.initial_snapshot["font_name"])
+        self.selected_font_family = cur_font if cur_font in self.fonts else (self.fonts[0] if self.fonts else "Sans")
+        self.selected_font_size = int(cur_size)
+
+        self.selected_layout = next(
+            (k for k, v in self.layouts.items() if v == self.initial_snapshot["button_layout"]),
+            "Right, standard"
+        )
+        self.selected_sound_theme = self.initial_snapshot["sound_theme"]
+        self.selected_event_sounds = self.initial_snapshot["event_sounds"]
+        self.selected_middle_click_paste = self.initial_snapshot["middle_click_paste"]
+        self.selected_text_scaling = self.initial_snapshot["text_scaling"]
+        self.selected_sync_qt = self.backend.is_qt_forced()
+
+        # Interactive Controls
+        self.active_dropdown = None
+        self.dropdown_hover_idx = -1
+        self.hover_button_id = None
+        self.click_rects = []
+
+        # Modal
+        self.modal_active = False
+        self.modal_title = ""
+        self.modal_msg = ""
+
+        # Scrollbar and view metrics
+        self.scroll_y = 0
+        self.max_scroll = 0
+        self.scrollbar_dragging = False
+        self.scrollbar_drag_offset_y = 0
+        self.scrollbar_hover = False
+        self.scrollbar_rect = (0, 0, 0, 0)
+
+        self._init_cairo()
+
+    def capture_system_snapshot(self):
+        self.initial_snapshot = {
+            "gtk_theme": self.backend.get_current_gtk_theme(),
+            "wm_theme": self.backend.get_current_wm_theme(),
+            "icon_theme": self.backend.get_current_icon_theme(),
+            "cursor_theme": self.backend.get_current_cursor_theme(),
+            "cursor_size": self.backend.get_current_cursor_size(),
+            "font_name": self.backend.get_current_font_name(),
+            "color_scheme": self.backend.get_current_color_scheme(),
+            "button_layout": self.backend.get_current_button_layout(),
+            "sound_theme": self.backend.get_current_sound_theme(),
+            "event_sounds": self.backend.get_current_event_sounds(),
+            "middle_click_paste": self.backend.get_current_middle_click_paste(),
+            "text_scaling": self.backend.get_current_text_scaling(),
+        }
+
+    def _init_cairo(self):
+        self.surface = cairo.ImageSurface(cairo.FORMAT_RGB24, self.width, self.height)
+        self.ctx = ThemedContext(cairo.Context(self.surface), prefers_light_scheme())
+        self.stride = self.surface.get_stride()
+        self.data_buffer = self.surface.get_data()
+
+    def get_selected_values(self):
+        return {
+            "gtk_theme": self.selected_gtk_theme,
+            "wm_theme": self.selected_wm_theme,
+            "icon_theme": self.selected_icon_theme,
+            "cursor_theme": self.selected_cursor_theme,
+            "cursor_size": self.selected_cursor_size,
+            "font": f"{self.selected_font_family} {self.selected_font_size}",
+            "button_layout": self.layouts.get(self.selected_layout, "appmenu:minimize,maximize,close"),
+            "color_scheme": self.color_schemes.get(self.selected_color_scheme, "default"),
+            "sound_theme": self.selected_sound_theme,
+            "event_sounds": self.selected_event_sounds,
+            "middle_click_paste": self.selected_middle_click_paste,
+            "text_scaling": self.selected_text_scaling,
+            "sync_qt": self.selected_sync_qt,
+        }
+
+    def trigger_live_preview(self):
+        if self.is_applied or self.is_updating:
+            return
+        self.is_updating = True
+        try:
+            v = self.get_selected_values()
+            self.backend.apply_live_desktop_gsettings(
+                v["gtk_theme"], v["wm_theme"], v["icon_theme"], v["cursor_theme"],
+                v["cursor_size"], v["font"], v["color_scheme"], v["button_layout"],
+                v["sound_theme"], v["event_sounds"], v["text_scaling"]
+            )
+        finally:
+            self.is_updating = False
+
+    def on_apply_clicked(self):
+        self.is_applied = True
+        v = self.get_selected_values()
+
+        self.backend.apply_live_desktop_gsettings(
+            v["gtk_theme"], v["wm_theme"], v["icon_theme"], v["cursor_theme"],
+            v["cursor_size"], v["font"], v["color_scheme"], v["button_layout"],
+            v["sound_theme"], v["event_sounds"], v["text_scaling"]
+        )
+        self.backend.commit_gtk2_file(
+            v["gtk_theme"], v["icon_theme"], v["cursor_theme"],
+            v["cursor_size"], v["font"], v["color_scheme"], v["event_sounds"]
+        )
+        self.backend.commit_gtk3_gtk4_files(
+            v["gtk_theme"], v["icon_theme"], v["cursor_theme"],
+            v["cursor_size"], v["font"], v["button_layout"], v["color_scheme"],
+            v["sound_theme"], v["event_sounds"], v["middle_click_paste"]
+        )
+        self.backend.commit_cursor_default(v["cursor_theme"])
+        self.backend.commit_xresources_cursor(v["cursor_theme"], v["cursor_size"])
+        self.backend.commit_mdeon_config(**v)
+        self.backend.apply_qt_env(v["sync_qt"])
+        self.backend.apply_flatpak_overrides(v["gtk_theme"], v["icon_theme"], v["cursor_theme"], v["cursor_size"])
+        self.backend.apply_xsettingsd(
+            v["gtk_theme"], v["icon_theme"], v["cursor_theme"],
+            v["cursor_size"], v["font"], v["color_scheme"],
+            v["sound_theme"], v["event_sounds"]
+        )
+        self.backend.apply_wm_specific_configs(v["gtk_theme"], v["button_layout"])
+
+        self.show_status_message(
+            "Appearance Settings Saved",
+            "GTK2, GTK3, GTK4, sound themes, event audio, icon, cursor, typography, "
+            "scaling factor, Qt sync, Flatpak overrides, and window-manager files "
+            "have been permanently synchronized."
+        )
+
+    def revert_live_preview(self):
+        if not self.is_applied:
+            logger.info("Reverting preview to initial session snapshot...")
+            init = self.initial_snapshot
+            self.backend.apply_live_desktop_gsettings(
+                init["gtk_theme"], init["wm_theme"], init["icon_theme"],
+                init["cursor_theme"], int(init["cursor_size"]), init["font_name"],
+                init["color_scheme"], init["button_layout"], init["sound_theme"],
+                init["event_sounds"], init["text_scaling"]
+            )
+
+    def show_status_message(self, title, msg):
+        self.modal_active = True
+        self.modal_title = title
+        self.modal_msg = msg
+        self.redraw()
+
+    # ------------------------------------------------------------------
+    # Cairo Drawing Engine
+    # ------------------------------------------------------------------
+    def redraw(self):
+        self.click_rects.clear()
+        cr = self.ctx
+
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgb(0.12, 0.12, 0.13)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+
+        self._draw_header(cr)
+
+        viewport_y = 78
+        viewport_h = self.height - 78 - 68
+        content_w = self.width - 44  # Leave space for right scrollbar
+
+        cr.save()
+        cr.rectangle(0, viewport_y, self.width - 20, viewport_h)
+        cr.clip()
+        cr.translate(0, -self.scroll_y)
+
+        cy = 90
+        # 1. Widget & Application Themes
+        cy = self._draw_group_themes(cr, 24, cy, content_w)
+        # 2. Window Decoration
+        cy = self._draw_group_window(cr, 24, cy + 18, content_w)
+        # 3. Typography & Display Scaling
+        cy = self._draw_group_fonts(cr, 24, cy + 18, content_w)
+        # 4. Cursor & Mouse
+        cy = self._draw_group_cursor(cr, 24, cy + 18, content_w)
+        # 5. Sound & Input Feedback (GTK4 Standard)
+        cy = self._draw_group_sound_input(cr, 24, cy + 18, content_w)
+        # 6. Detected Multi-WM Targets
+        cy = self._draw_group_detection(cr, 24, cy + 18, content_w)
+
+        total_content_height = cy + 24
+        self.max_scroll = max(0, total_content_height - (viewport_y + viewport_h))
+        cr.restore()
+
+        # Render Right Scrollbar
+        self._draw_scrollbar(cr, viewport_y, viewport_h, total_content_height)
+
+        # Bottom Bar
+        self._draw_bottom_bar(cr)
+
+        # Overlays
+        if self.active_dropdown:
+            self._draw_dropdown_overlay(cr)
+
+        if self.modal_active:
+            self._draw_modal_dialog(cr)
+
+        self.surface.flush()
+        self.flush_cb()
+
+    def _draw_header(self, cr):
+        cr.set_source_rgb(0.14, 0.14, 0.16)
+        cr.rectangle(0, 0, self.width, 78)
+        cr.fill()
+
+        cr.set_source_rgb(0.22, 0.22, 0.24)
+        cr.set_line_width(1.0)
+        cr.move_to(0, 77.5)
+        cr.line_to(self.width, 77.5)
+        cr.stroke()
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(17.0)
+        cr.set_source_rgb(0.96, 0.96, 0.96)
+        cr.move_to(28, 33)
+        cr.show_text(APP_NAME)
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(11.0)
+        cr.set_source_rgb(0.68, 0.68, 0.70)
+        cr.move_to(28, 54)
+        cr.show_text("Unified GTK4, GTK3, GTK2, Qt, Sound Themes, Wayland & X11 appearance manager.")
+
+    def _draw_rounded_card(self, cr, x, y, w, h, r=10):
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+
+    def _draw_group_title(self, cr, title, x, y):
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(12.0)
+        cr.set_source_rgb(0.48, 0.68, 0.96)
+        cr.move_to(x + 4, y)
+        cr.show_text(title.upper())
+        return y + 10
+
+    def _draw_group_themes(self, cr, x, y, w):
+        y = self._draw_group_title(cr, "Application & Widget Styling", x, y)
+        card_h = 52 * 5 + 6
+        self._draw_rounded_card(cr, x, y, w, card_h)
+        cr.set_source_rgb(0.17, 0.17, 0.19)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.24, 0.24, 0.26)
+        cr.set_line_width(1.0)
+        cr.stroke()
+
+        rows = [
+            ("Color scheme", "Select dark, light, or standard system appearance", "combo_color_scheme", self.selected_color_scheme),
+            ("GTK Application theme", "GTK2, GTK3, and GTK4 widget style suite", "combo_gtk_theme", self.selected_gtk_theme),
+            ("Window theme", "Window borders, titlebar, and frame styling", "combo_wm_theme", self.selected_wm_theme),
+            ("Icon theme", "Desktop and application icon suite", "combo_icon_theme", self.selected_icon_theme),
+            ("Sync Qt applications", "Write QT_QPA_PLATFORMTHEME=gtk3 environment variable", "switch_qt", self.selected_sync_qt),
+        ]
+
+        row_y = y + 3
+        for i, (title, sub, ctrl_id, val) in enumerate(rows):
+            self._draw_row(cr, x, row_y, w, 52, title, sub, ctrl_id, val, is_last=(i == len(rows) - 1))
+            row_y += 52
+
+        return y + card_h
+
+    def _draw_group_window(self, cr, x, y, w):
+        y = self._draw_group_title(cr, "Window Decoration", x, y)
+        card_h = 52 + 6
+        self._draw_rounded_card(cr, x, y, w, card_h)
+        cr.set_source_rgb(0.17, 0.17, 0.19)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.24, 0.24, 0.26)
+        cr.set_line_width(1.0)
+        cr.stroke()
+
+        self._draw_row(
+            cr, x, y + 3, w, 52,
+            "Titlebar button layout", "Arrangement of close, minimize, and maximize buttons",
+            "combo_button_layout", self.selected_layout, is_last=True
+        )
+        return y + card_h
+
+    def _draw_group_fonts(self, cr, x, y, w):
+        y = self._draw_group_title(cr, "Typography & Display Scaling", x, y)
+        card_h = 52 * 3 + 6
+        self._draw_rounded_card(cr, x, y, w, card_h)
+        cr.set_source_rgb(0.17, 0.17, 0.19)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.24, 0.24, 0.26)
+        cr.set_line_width(1.0)
+        cr.stroke()
+
+        rows = [
+            ("Font family", "Primary interface typography font family", "combo_font_family", self.selected_font_family),
+            ("Font size", "Interface base font scale in points", "spin_font_size", self.selected_font_size),
+            ("Text scaling factor", "Universal DPI text scaling multiplier", "spin_text_scaling", f"{self.selected_text_scaling:.2f}x"),
+        ]
+
+        row_y = y + 3
+        for i, (title, sub, ctrl_id, val) in enumerate(rows):
+            self._draw_row(cr, x, row_y, w, 52, title, sub, ctrl_id, val, is_last=(i == len(rows) - 1))
+            row_y += 52
+
+        return y + card_h
+
+    def _draw_group_cursor(self, cr, x, y, w):
+        y = self._draw_group_title(cr, "Cursor & Pointer", x, y)
+        card_h = 52 * 2 + 6
+        self._draw_rounded_card(cr, x, y, w, card_h)
+        cr.set_source_rgb(0.17, 0.17, 0.19)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.24, 0.24, 0.26)
+        cr.set_line_width(1.0)
+        cr.stroke()
+
+        rows = [
+            ("Cursor theme", "Active desktop pointer styling suite", "combo_cursor_theme", self.selected_cursor_theme),
+            ("Cursor size", "Pointer dimensions in pixels (16-128)", "spin_cursor_size", self.selected_cursor_size),
+        ]
+
+        row_y = y + 3
+        for i, (title, sub, ctrl_id, val) in enumerate(rows):
+            self._draw_row(cr, x, row_y, w, 52, title, sub, ctrl_id, val, is_last=(i == len(rows) - 1))
+            row_y += 52
+
+        return y + card_h
+
+    def _draw_group_sound_input(self, cr, x, y, w):
+        y = self._draw_group_title(cr, "Sound & Input Behaviors (GTK4 Standard)", x, y)
+        card_h = 52 * 3 + 6
+        self._draw_rounded_card(cr, x, y, w, card_h)
+        cr.set_source_rgb(0.17, 0.17, 0.19)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.24, 0.24, 0.26)
+        cr.set_line_width(1.0)
+        cr.stroke()
+
+        rows = [
+            ("Sound theme", "Active XDG sound theme pack", "combo_sound_theme", self.selected_sound_theme),
+            ("Event feedback audio", "Play audible cues on alerts and system notifications", "switch_event_sounds", self.selected_event_sounds),
+            ("Middle-click paste", "Paste primary selection buffer via middle mouse button", "switch_middle_paste", self.selected_middle_click_paste),
+        ]
+
+        row_y = y + 3
+        for i, (title, sub, ctrl_id, val) in enumerate(rows):
+            self._draw_row(cr, x, row_y, w, 52, title, sub, ctrl_id, val, is_last=(i == len(rows) - 1))
+            row_y += 52
+
+        return y + card_h
+
+    def _draw_group_detection(self, cr, x, y, w):
+        y = self._draw_group_title(cr, "Auto-Detected Target Environments", x, y)
+        card_h = 44 * 5 + 6
+        self._draw_rounded_card(cr, x, y, w, card_h)
+        cr.set_source_rgb(0.17, 0.17, 0.19)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.24, 0.24, 0.26)
+        cr.set_line_width(1.0)
+        cr.stroke()
+
+        wf = self.backend.detect_wayfire_config()
+        lb = self.backend.detect_labwc_config()
+        items = [
+            ("Wayfire configuration", f"Active: {wf}" if os.path.exists(wf) else f"Target: {wf}"),
+            ("Labwc configuration", f"Active: {lb}" if os.path.exists(lb) else f"Target: {lb}"),
+            ("GTK2 legacy", "Target: ~/.gtkrc-2.0"),
+            ("GTK3 modern", "Target: ~/.config/gtk-3.0/settings.ini"),
+            ("GTK4 modern", "Target: ~/.config/gtk-4.0/settings.ini"),
+        ]
+
+        row_y = y + 3
+        for i, (title, sub) in enumerate(items):
+            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            cr.set_font_size(12.0)
+            cr.set_source_rgb(0.85, 0.85, 0.85)
+            cr.move_to(x + 18, row_y + 19)
+            cr.show_text(title)
+
+            cr.set_font_size(10.0)
+            cr.set_source_rgb(0.55, 0.55, 0.58)
+            cr.move_to(x + 18, row_y + 34)
+            cr.show_text(sub)
+
+            if i < len(items) - 1:
+                cr.set_source_rgb(0.21, 0.21, 0.23)
+                cr.set_line_width(1.0)
+                cr.move_to(x + 18, row_y + 43.5)
+                cr.line_to(x + w - 18, row_y + 43.5)
+                cr.stroke()
+            row_y += 44
+
+        return y + card_h
+
+    def _draw_row(self, cr, x, y, w, h, title, subtitle, ctrl_id, val, is_last=False):
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(13.0)
+        cr.set_source_rgb(0.92, 0.92, 0.92)
+        cr.move_to(x + 18, y + 23)
+        cr.show_text(title)
+
+        cr.set_font_size(10.5)
+        cr.set_source_rgb(0.58, 0.58, 0.62)
+        cr.move_to(x + 18, y + 40)
+        cr.show_text(subtitle)
+
+        ctrl_w = 210
+        ctrl_h = 32
+        ctrl_x = x + w - ctrl_w - 18
+        ctrl_y = y + (h - ctrl_h) // 2
+
+        if ctrl_id.startswith("combo_"):
+            self._draw_combo_box(cr, ctrl_x, ctrl_y, ctrl_w, ctrl_h, ctrl_id, str(val))
+        elif ctrl_id.startswith("switch_"):
+            self._draw_switch(cr, ctrl_x + ctrl_w - 54, ctrl_y + 2, 54, 28, ctrl_id, bool(val))
+        elif ctrl_id.startswith("spin_"):
+            self._draw_spin(cr, ctrl_x + ctrl_w - 120, ctrl_y, 120, ctrl_h, ctrl_id, str(val))
+
+        if not is_last:
+            cr.set_source_rgb(0.21, 0.21, 0.23)
+            cr.set_line_width(1.0)
+            cr.move_to(x + 18, y + h - 0.5)
+            cr.line_to(x + w - 18, y + h - 0.5)
+            cr.stroke()
+
+    def _draw_combo_box(self, cr, x, y, w, h, ctrl_id, value_text):
+        self._draw_rounded_card(cr, x, y, w, h, 6)
+        is_hover = (self.hover_button_id == ctrl_id)
+        cr.set_source_rgb(0.24, 0.24, 0.27 if not is_hover else 0.30)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.33, 0.33, 0.36)
+        cr.set_line_width(1.0)
+        cr.stroke()
+
+        cr.save()
+        cr.rectangle(x + 10, y, w - 30, h)
+        cr.clip()
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(12.0)
+        cr.set_source_rgb(0.90, 0.90, 0.92)
+        cr.move_to(x + 10, y + 20)
+        cr.show_text(value_text)
+        cr.restore()
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(10.0)
+        cr.set_source_rgb(0.70, 0.70, 0.74)
+        cr.move_to(x + w - 18, y + 20)
+        cr.show_text("▼")
+
+        self.click_rects.append((x, y, w, h, ctrl_id, None))
+
+    def _draw_switch(self, cr, x, y, w, h, ctrl_id, is_active):
+        self._draw_rounded_card(cr, x, y, w, h, h // 2)
+        if is_active:
+            cr.set_source_rgb(0.21, 0.52, 0.89)
+        else:
+            cr.set_source_rgb(0.26, 0.26, 0.28)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.35, 0.35, 0.38)
+        cr.set_line_width(1.0)
+        cr.stroke()
+
+        knob_r = (h - 6) / 2
+        knob_x = (x + w - knob_r - 3) if is_active else (x + knob_r + 3)
+        knob_y = y + h / 2
+        cr.arc(knob_x, knob_y, knob_r, 0, 2 * math.pi)
+        cr.set_source_rgb(1.0, 1.0, 1.0)
+        cr.fill()
+
+        self.click_rects.append((x, y, w, h, ctrl_id, None))
+
+    def _draw_spin(self, cr, x, y, w, h, ctrl_id, value_str):
+        btn_w = 32
+        self._draw_rounded_card(cr, x, y, btn_w, h, 6)
+        cr.set_source_rgb(0.24, 0.24, 0.27)
+        cr.fill()
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(14.0)
+        cr.set_source_rgb(0.9, 0.9, 0.9)
+        cr.move_to(x + 11, y + 21)
+        cr.show_text("-")
+        self.click_rects.append((x, y, btn_w, h, f"{ctrl_id}_dec", None))
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(12.5)
+        cr.set_source_rgb(0.95, 0.95, 0.95)
+        ext = cr.text_extents(value_str)
+        cr.move_to(x + btn_w + (w - btn_w * 2 - ext.width) / 2, y + 21)
+        cr.show_text(value_str)
+
+        px = x + w - btn_w
+        self._draw_rounded_card(cr, px, y, btn_w, h, 6)
+        cr.set_source_rgb(0.24, 0.24, 0.27)
+        cr.fill()
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(14.0)
+        cr.set_source_rgb(0.9, 0.9, 0.9)
+        cr.move_to(px + 10, y + 21)
+        cr.show_text("+")
+        self.click_rects.append((px, y, btn_w, h, f"{ctrl_id}_inc", None))
+
+    def _draw_scrollbar(self, cr, vy, vh, total_h):
+        if self.max_scroll <= 0:
+            return
+
+        sb_w = 8
+        sb_x = self.width - sb_w - 6
+        sb_track_h = vh - 16
+        sb_y = vy + 8
+
+        # Track background
+        self._draw_rounded_card(cr, sb_x, sb_y, sb_w, sb_track_h, sb_w // 2)
+        cr.set_source_rgba(0.2, 0.2, 0.22, 0.35)
+        cr.fill()
+
+        # Thumb dimensions
+        thumb_h = max(32, int(sb_track_h * (vh / float(total_h))))
+        available_range = sb_track_h - thumb_h
+        thumb_y = sb_y + int((self.scroll_y / float(self.max_scroll)) * available_range)
+
+        self.scrollbar_rect = (sb_x - 4, thumb_y, sb_w + 8, thumb_h)
+        self.scrollbar_track_rect = (sb_x - 4, sb_y, sb_w + 8, sb_track_h)
+
+        # Thumb body
+        self._draw_rounded_card(cr, sb_x, thumb_y, sb_w, thumb_h, sb_w // 2)
+        if self.scrollbar_dragging:
+            cr.set_source_rgb(0.35, 0.65, 1.0)
+        elif self.scrollbar_hover:
+            cr.set_source_rgb(0.50, 0.50, 0.54)
+        else:
+            cr.set_source_rgb(0.35, 0.35, 0.38)
+        cr.fill()
+
+    def _draw_bottom_bar(self, cr):
+        by = self.height - 68
+        cr.set_source_rgb(0.14, 0.14, 0.16)
+        cr.rectangle(0, by, self.width, 68)
+        cr.fill()
+
+        cr.set_source_rgb(0.22, 0.22, 0.24)
+        cr.set_line_width(1.0)
+        cr.move_to(0, by + 0.5)
+        cr.line_to(self.width, by + 0.5)
+        cr.stroke()
+
+        bw, bh = 260, 40
+        bx = (self.width - bw) // 2
+        by_btn = by + 14
+
+        self._draw_rounded_card(cr, bx, by_btn, bw, bh, bh // 2)
+        cr.set_source_rgb(0.21, 0.52, 0.89)
+        cr.fill()
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(13.0)
+        cr.set_source_rgb(1.0, 1.0, 1.0)
+        text = "Save and Apply Permanently"
+        ext = cr.text_extents(text)
+        cr.move_to(bx + (bw - ext.width) / 2, by_btn + 25)
+        cr.show_text(text)
+
+        self.click_rects.append((bx, by_btn, bw, bh, "btn_apply", None))
+
+    def _draw_dropdown_overlay(self, cr):
+        dd = self.active_dropdown
+        x, y, w, max_h = dd["x"], dd["y"], dd["w"], dd["max_h"]
+        items = dd["items"]
+        scroll = dd.get("scroll", 0)
+        item_h = 30
+        visible_count = min(len(items), max_h // item_h)
+        total_h = visible_count * item_h + 10
+
+        if y + total_h > self.height - 70:
+            y = max(10, y - total_h - 34)
+
+        cr.set_source_rgba(0, 0, 0, 0.45)
+        cr.rectangle(x + 2, y + 2, w, total_h)
+        cr.fill()
+
+        self._draw_rounded_card(cr, x, y, w, total_h, 6)
+        cr.set_source_rgb(0.18, 0.18, 0.20)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.32, 0.32, 0.35)
+        cr.set_line_width(1.0)
+        cr.stroke()
+
+        cr.save()
+        cr.rectangle(x, y + 5, w, total_h - 10)
+        cr.clip()
+
+        for idx, item in enumerate(items):
+            iy = y + 5 + idx * item_h - scroll
+            if iy + item_h < y or iy > y + total_h:
+                continue
+
+            if idx == self.dropdown_hover_idx:
+                cr.set_source_rgb(0.24, 0.50, 0.85)
+                cr.rectangle(x + 4, iy + 1, w - 8, item_h - 2)
+                cr.fill()
+
+            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            cr.set_font_size(12.0)
+            cr.set_source_rgb(1.0, 1.0, 1.0)
+            cr.move_to(x + 12, iy + 20)
+            cr.show_text(str(item))
+
+        cr.restore()
+        dd["actual_y"] = y
+        dd["actual_h"] = total_h
+
+    def _draw_modal_dialog(self, cr):
+        cr.set_source_rgba(0, 0, 0, 0.65)
+        cr.rectangle(0, 0, self.width, self.height)
+        cr.fill()
+
+        mw, mh = 480, 200
+        mx = (self.width - mw) // 2
+        my = (self.height - mh) // 2
+
+        self._draw_rounded_card(cr, mx, my, mw, mh, 10)
+        cr.set_source_rgb(0.18, 0.18, 0.20)
+        cr.fill_preserve()
+        cr.set_source_rgb(0.30, 0.30, 0.34)
+        cr.set_line_width(1.0)
+        cr.stroke()
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(15.0)
+        cr.set_source_rgb(0.96, 0.96, 0.96)
+        cr.move_to(mx + 24, my + 38)
+        cr.show_text(self.modal_title)
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(12.0)
+        cr.set_source_rgb(0.75, 0.75, 0.78)
+
+        words = self.modal_msg.split()
+        lines, cur = [], ""
+        for w in words:
+            candidate = f"{cur} {w}".strip()
+            if cr.text_extents(candidate).width > mw - 48:
+                lines.append(cur)
+                cur = w
+            else:
+                cur = candidate
+        if cur:
+            lines.append(cur)
+
+        ly = my + 72
+        for line in lines[:4]:
+            cr.move_to(mx + 24, ly)
+            cr.show_text(line)
+            ly += 18
+
+        btn_w, btn_h = 90, 32
+        bx = mx + mw - btn_w - 24
+        by = my + mh - btn_h - 20
+        self._draw_rounded_card(cr, bx, by, btn_w, btn_h, 6)
+        cr.set_source_rgb(0.24, 0.50, 0.85)
+        cr.fill()
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(12.0)
+        cr.set_source_rgb(1.0, 1.0, 1.0)
+        cr.move_to(bx + 32, by + 21)
+        cr.show_text("OK")
+
+        self.click_rects.append((bx, by, btn_w, btn_h, "btn_modal_ok", None))
+
+    # ------------------------------------------------------------------
+    # User Input & Interaction Handling
+    # ------------------------------------------------------------------
+    def handle_scroll(self, dy):
+        if self.active_dropdown:
+            dd = self.active_dropdown
+            items_h = len(dd["items"]) * 30
+            max_s = max(0, items_h - (dd.get("actual_h", 240) - 10))
+            dd["scroll"] = max(0, min(max_s, dd.get("scroll", 0) + dy * 24))
+            self.redraw()
+            return
+
+        if self.max_scroll > 0:
+            self.scroll_y = max(0, min(self.max_scroll, self.scroll_y + dy * 32))
+            self.redraw()
+
+    def handle_motion(self, x, y):
+        # Handle Scrollbar dragging
+        if self.scrollbar_dragging and self.max_scroll > 0:
+            _, ty, _, th = self.scrollbar_track_rect
+            effective_track = th - (self.scrollbar_rect[3])
+            if effective_track > 0:
+                cur_pos = y - ty - self.scrollbar_drag_offset_y
+                ratio = max(0.0, min(1.0, cur_pos / float(effective_track)))
+                self.scroll_y = int(ratio * self.max_scroll)
+                self.redraw()
+            return
+
+        # Check scrollbar hover
+        sx, sy, sw, sh = self.scrollbar_rect
+        is_hover = (sx <= x <= sx + sw and sy <= y <= sy + sh)
+        if is_hover != self.scrollbar_hover:
+            self.scrollbar_hover = is_hover
+            self.redraw()
+
+        self.hover_button_id = None
+        if self.active_dropdown:
+            dd = self.active_dropdown
+            dx, dy = dd["x"], dd.get("actual_y", dd["y"])
+            dw, dh = dd["w"], dd.get("actual_h", 200)
+            if dx <= x <= dx + dw and dy <= y <= dy + dh:
+                rel_y = y - (dy + 5) + dd.get("scroll", 0)
+                self.dropdown_hover_idx = max(0, min(len(dd["items"]) - 1, int(rel_y // 30)))
+                self.redraw()
+                return
+            else:
+                self.dropdown_hover_idx = -1
+                return
+
+        for rx, ry, rw, rh, cid, _ in self.click_rects:
+            if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                self.hover_button_id = cid
+                break
+
+    def handle_click(self, x, y, button=1):
+        if button != 1:
+            return
+
+        if self.modal_active:
+            for rx, ry, rw, rh, cid, _ in self.click_rects:
+                if cid == "btn_modal_ok" and rx <= x <= rx + rw and ry <= y <= ry + rh:
+                    self.modal_active = False
+                    self.redraw()
+            return
+
+        # Check Scrollbar Click / Drag
+        sx, sy, sw, sh = self.scrollbar_rect
+        if sx <= x <= sx + sw and sy <= y <= sy + sh:
+            self.scrollbar_dragging = True
+            self.scrollbar_drag_offset_y = y - sy
+            return
+
+        # Scrollbar Track Click-to-Jump
+        if hasattr(self, "scrollbar_track_rect"):
+            tx, ty, tw, th = self.scrollbar_track_rect
+            if tx <= x <= tx + tw and ty <= y <= ty + th:
+                effective_track = th - sh
+                if effective_track > 0:
+                    target_pos = y - ty - (sh // 2)
+                    ratio = max(0.0, min(1.0, target_pos / float(effective_track)))
+                    self.scroll_y = int(ratio * self.max_scroll)
+                    self.scrollbar_dragging = True
+                    self.scrollbar_drag_offset_y = sh // 2
+                    self.redraw()
+                    return
+
+        # Dropdown selection
+        if self.active_dropdown:
+            dd = self.active_dropdown
+            dx, dy = dd["x"], dd.get("actual_y", dd["y"])
+            dw, dh = dd["w"], dd.get("actual_h", 200)
+
+            if dx <= x <= dx + dw and dy <= y <= dy + dh:
+                idx = int((y - (dy + 5) + dd.get("scroll", 0)) // 30)
+                if 0 <= idx < len(dd["items"]):
+                    val = dd["items"][idx]
+                    cid = dd["id"]
+                    if cid == "combo_color_scheme":
+                        self.selected_color_scheme = val
+                    elif cid == "combo_gtk_theme":
+                        self.selected_gtk_theme = val
+                    elif cid == "combo_wm_theme":
+                        self.selected_wm_theme = val
+                    elif cid == "combo_icon_theme":
+                        self.selected_icon_theme = val
+                    elif cid == "combo_sound_theme":
+                        self.selected_sound_theme = val
+                    elif cid == "combo_button_layout":
+                        self.selected_layout = val
+                    elif cid == "combo_font_family":
+                        self.selected_font_family = val
+                    elif cid == "combo_cursor_theme":
+                        self.selected_cursor_theme = val
+
+                    self.active_dropdown = None
+                    self.trigger_live_preview()
+                    self.redraw()
+                    return
+
+            self.active_dropdown = None
+            self.redraw()
+            return
+
+        # Dispatched Row Elements
+        for rx, ry, rw, rh, cid, _ in list(self.click_rects):
+            if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                if cid.startswith("combo_"):
+                    items = []
+                    if cid == "combo_color_scheme":
+                        items = list(self.color_schemes.keys())
+                    elif cid in ("combo_gtk_theme", "combo_wm_theme"):
+                        items = self.gtk_themes
+                    elif cid == "combo_icon_theme":
+                        items = self.icon_themes
+                    elif cid == "combo_sound_theme":
+                        items = self.sound_themes
+                    elif cid == "combo_cursor_theme":
+                        items = self.cursor_themes
+                    elif cid == "combo_font_family":
+                        items = self.fonts
+                    elif cid == "combo_button_layout":
+                        items = list(self.layouts.keys())
+
+                    self.active_dropdown = {
+                        "id": cid, "x": rx, "y": ry + rh + 4,
+                        "w": rw, "max_h": 240, "items": items, "scroll": 0
+                    }
+                    self.redraw()
+                    return
+
+                elif cid == "switch_qt":
+                    self.selected_sync_qt = not self.selected_sync_qt
+                    self.redraw()
+                    return
+
+                elif cid == "switch_event_sounds":
+                    self.selected_event_sounds = not self.selected_event_sounds
+                    self.trigger_live_preview()
+                    self.redraw()
+                    return
+
+                elif cid == "switch_middle_paste":
+                    self.selected_middle_click_paste = not self.selected_middle_click_paste
+                    self.redraw()
+                    return
+
+                elif cid == "spin_font_size_dec":
+                    self.selected_font_size = max(6, self.selected_font_size - 1)
+                    self.trigger_live_preview()
+                    self.redraw()
+                    return
+                elif cid == "spin_font_size_inc":
+                    self.selected_font_size = min(72, self.selected_font_size + 1)
+                    self.trigger_live_preview()
+                    self.redraw()
+                    return
+
+                elif cid == "spin_text_scaling_dec":
+                    self.selected_text_scaling = max(0.5, round(self.selected_text_scaling - 0.05, 2))
+                    self.trigger_live_preview()
+                    self.redraw()
+                    return
+                elif cid == "spin_text_scaling_inc":
+                    self.selected_text_scaling = min(3.0, round(self.selected_text_scaling + 0.05, 2))
+                    self.trigger_live_preview()
+                    self.redraw()
+                    return
+
+                elif cid == "spin_cursor_size_dec":
+                    self.selected_cursor_size = max(16, self.selected_cursor_size - 8)
+                    self.trigger_live_preview()
+                    self.redraw()
+                    return
+                elif cid == "spin_cursor_size_inc":
+                    self.selected_cursor_size = min(128, self.selected_cursor_size + 8)
+                    self.trigger_live_preview()
+                    self.redraw()
+                    return
+
+                elif cid == "btn_apply":
+                    self.on_apply_clicked()
+                    return
+
+    def handle_release(self, button=1):
+        if button == 1 and self.scrollbar_dragging:
+            self.scrollbar_dragging = False
+            self.redraw()
+
+    def handle_key(self, keysym):
+        if keysym == 0xff1b:  # Escape
+            if self.active_dropdown:
+                self.active_dropdown = None
+                self.redraw()
+            elif self.modal_active:
+                self.modal_active = False
+                self.redraw()
+
+
+# ----------------------------------------------------------------------
+# X11 Strict Protocol Binding
+# ----------------------------------------------------------------------
+class XEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("pad", ctypes.c_byte * 192)]
+
+class XKeyEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint), ("keycode", ctypes.c_uint), ("same_screen", ctypes.c_int)
+    ]
+
+class XMotionEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint), ("is_hint", ctypes.c_char), ("same_screen", ctypes.c_int),
+    ]
+
+class XButtonEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint), ("button", ctypes.c_uint), ("same_screen", ctypes.c_int),
+    ]
+
+class XClientData(ctypes.Union):
+    _fields_ = [
+        ("b", ctypes.c_char * 20),
+        ("s", ctypes.c_short * 10),
+        ("l", ctypes.c_long * 5),
+    ]
+
+class XClientMessageEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("message_type", ctypes.c_ulong),
+        ("format", ctypes.c_int), ("data", XClientData),
+    ]
+
+x11 = None
+try:
+    x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+
+    x11.XDefaultScreen.restype = ctypes.c_int
+    x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+
+    x11.XRootWindow.restype = ctypes.c_ulong
+    x11.XRootWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+    x11.XDefaultVisual.restype = ctypes.c_void_p
+    x11.XDefaultVisual.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+    x11.XDefaultDepth.restype = ctypes.c_int
+    x11.XDefaultDepth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+    x11.XDisplayWidth.restype = ctypes.c_int
+    x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+    x11.XDisplayHeight.restype = ctypes.c_int
+    x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+    x11.XCreateSimpleWindow.restype = ctypes.c_ulong
+    x11.XCreateSimpleWindow.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_ulong
+    ]
+
+    x11.XCreateGC.restype = ctypes.c_void_p
+    x11.XCreateGC.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+
+    x11.XCreateImage.restype = ctypes.c_void_p
+    x11.XCreateImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_int,
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int
+    ]
+
+    x11.XPutImage.restype = ctypes.c_int
+    x11.XPutImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint
+    ]
+
+    x11.XSelectInput.restype = ctypes.c_int
+    x11.XSelectInput.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long]
+
+    x11.XMapWindow.restype = ctypes.c_int
+    x11.XMapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+
+    x11.XFlush.restype = ctypes.c_int
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+
+    x11.XPending.restype = ctypes.c_int
+    x11.XPending.argtypes = [ctypes.c_void_p]
+
+    x11.XNextEvent.restype = ctypes.c_int
+    x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+
+    x11.XSetWMProtocols.restype = ctypes.c_int
+    x11.XSetWMProtocols.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.c_int]
+
+    x11.XStoreName.restype = ctypes.c_int
+    x11.XStoreName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_char_p]
+
+    x11.XChangeProperty.restype = ctypes.c_int
+    x11.XChangeProperty.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int
+    ]
+
+    x11.XKeycodeToKeysym.restype = ctypes.c_ulong
+    x11.XKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int]
+
+    x11.XCloseDisplay.restype = ctypes.c_int
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+except OSError:
+    pass
+
+
+def run_x11():
+    if not x11:
+        raise RuntimeError("libX11.so.6 not available on this platform")
+
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise RuntimeError("Cannot open X11 Display")
+
+    screen = x11.XDefaultScreen(display)
+    root = x11.XRootWindow(display, screen)
+    visual = x11.XDefaultVisual(display, screen)
+    depth = x11.XDefaultDepth(display, screen)
+
+    width = 780
+    height = 760
+    screen_w = x11.XDisplayWidth(display, screen)
+    screen_h = x11.XDisplayHeight(display, screen)
+    x = max(20, (screen_w - width) // 2)
+    y = max(20, (screen_h - height) // 2)
+
+    win = x11.XCreateSimpleWindow(display, root, x, y, width, height, 0, 0, 0x1e1e20)
+    gc = x11.XCreateGC(display, win, 0, None)
+
+    x11.XStoreName(display, win, APP_NAME.encode("utf-8"))
+
+    # Register _NET_WM_PID so task managers associate the process
+    atom_pid = x11.XInternAtom(display, b"_NET_WM_PID", 0)
+    atom_cardinal = x11.XInternAtom(display, b"CARDINAL", 0)
+    pid_data = (ctypes.c_ulong * 1)(os.getpid())
+    x11.XChangeProperty(
+        display, win, atom_pid, atom_cardinal, 32, 0,
+        ctypes.cast(pid_data, ctypes.c_void_p), 1
+    )
+
+    # Register WM_CLASS
+    atom_class = x11.XInternAtom(display, b"WM_CLASS", 0)
+    atom_string = x11.XInternAtom(display, b"STRING", 0)
+    wm_class = b"mdeon-appearance\0mdeon-appearance\0"
+    x11.XChangeProperty(
+        display, win, atom_class, atom_string, 8, 0,
+        ctypes.cast(ctypes.c_char_p(wm_class), ctypes.c_void_p), len(wm_class)
+    )
+
+    # WM_DELETE_WINDOW protocol
+    wm_protocols = x11.XInternAtom(display, b"WM_PROTOCOLS", 0)
+    wm_delete_window = x11.XInternAtom(display, b"WM_DELETE_WINDOW", 0)
+    protocols = (ctypes.c_ulong * 1)(wm_delete_window)
+    x11.XSetWMProtocols(display, win, protocols, 1)
+
+    event_mask = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 6) | (1 << 15)
+    x11.XSelectInput(display, win, event_mask)
+    x11.XMapWindow(display, win)
+    x11.XFlush(display)
+
+    app = None
+
+    def flush():
+        if app is not None and getattr(app, "ximage", None):
+            x11.XPutImage(display, win, gc, app.ximage, 0, 0, 0, 0, width, height)
+            x11.XFlush(display)
+
+    app = MdeonAppearanceCore(width, height, flush)
+
+    app.c_data = (ctypes.c_char * (app.stride * height)).from_buffer(app.data_buffer)
+    app.ximage = x11.XCreateImage(
+        display, visual, depth, 2, 0, ctypes.addressof(app.c_data), width, height, 32, app.stride
+    )
+
+    app.redraw()
+    ev = XEvent()
+
+    try:
+        while True:
+            while x11.XPending(display):
+                x11.XNextEvent(display, ctypes.byref(ev))
+                if ev.type == 12:  # Expose
+                    app.redraw()
+                elif ev.type == 6:  # MotionNotify
+                    mev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XMotionEvent)).contents
+                    app.handle_motion(mev.x, mev.y)
+                elif ev.type == 4:  # ButtonPress
+                    bev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XButtonEvent)).contents
+                    if bev.button == 4:
+                        app.handle_scroll(-1)
+                    elif bev.button == 5:
+                        app.handle_scroll(1)
+                    else:
+                        app.handle_click(bev.x, bev.y, bev.button)
+                elif ev.type == 5:  # ButtonRelease
+                    bev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XButtonEvent)).contents
+                    app.handle_release(bev.button)
+                elif ev.type == 2:  # KeyPress
+                    kev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XKeyEvent)).contents
+                    keysym = x11.XKeycodeToKeysym(display, kev.keycode, 0)
+                    app.handle_key(keysym)
+                elif ev.type == 33:  # ClientMessage
+                    cmev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XClientMessageEvent)).contents
+                    if cmev.data.l[0] == wm_delete_window:
+                        app.revert_live_preview()
+                        return 0
+            time.sleep(0.015)
+    except KeyboardInterrupt:
+        app.revert_live_preview()
+        return 0
+    finally:
+        x11.XCloseDisplay(display)
+
+
+# ----------------------------------------------------------------------
+# Application Entrypoint
+# ----------------------------------------------------------------------
+def main():
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        logger.error("No graphical display found ($DISPLAY or $WAYLAND_DISPLAY).")
+        return 1
+    try:
+        return run_x11()
+    except Exception as exc:
+        logger.exception("Fatal runtime error: %s", exc)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

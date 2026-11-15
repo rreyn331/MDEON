@@ -1,0 +1,125 @@
+# /etc/mdeon/mdeon.conf.default
+# MDEON — Minimal Desktop Environment, Optimized for Needs
+
+# ==========================================================
+# GENERAL SESSION CONFIGURATION
+# ==========================================================
+
+MDEON_NAME="MDEON"
+
+# Used as fallback terminal/session master if no dock or panel is available.
+FALLBACK_TERM="x-terminal-emulator"
+
+# sequential or parallel
+AUTOSTART_MODE="sequential"
+
+# New MDEON autostart manager.
+# Replaces old /usr/bin/xdg-session-manager.
+AUTOSTART_MANAGER="/usr/bin/mdeon-autostart"
+AUTOSTART_MANAGER_OPTIONS="--session"
+
+# ==========================================================
+# COMMON APPEARANCE SETTINGS
+# Used by both X11 and Wayland unless overridden later.
+# ==========================================================
+
+WALLPAPER=""
+FALLBACK_COLOR="#FFB6C1"
+
+# ==========================================================
+# COMMON VOLUME SETTINGS
+# Used by both sessions unless backend-specific override is set.
+# ==========================================================
+
+VOLUME="pasystray"
+VOLUME_OPTIONS=""
+USE_VOLUME="true"
+
+# Optional backend-specific volume overrides.
+# Leave empty to use the common values above.
+
+X11_VOLUME=""
+X11_VOLUME_OPTIONS=""
+X11_USE_VOLUME=""
+
+WAYLAND_VOLUME=""
+WAYLAND_VOLUME_OPTIONS=""
+WAYLAND_USE_VOLUME=""
+
+# ==========================================================
+# COMMON DESKTOP MANAGER FALLBACKS
+# Used by both sessions unless backend-specific values override it.
+# ==========================================================
+
+DESKTOP_MANAGER="mdeon-desktop"
+DESKTOP_MANAGER_OPTIONS=""
+USE_DESKTOP_MANAGER="true"
+
+# ==========================================================
+# X11 SESSION CONFIGURATION
+# ==========================================================
+
+X11_SESSION_SCRIPT_PATH="/usr/bin/mdeon-session"
+
+# Desktop Manager Settings
+X11_DESKTOP_MANAGER="mdeon-desktop"
+X11_DESKTOP_MANAGER_OPTIONS=""
+X11_USE_DESKTOP_MANAGER="true"
+
+# Window Manager Settings
+
+WINDOW_MANAGER="xfwm4"
+WINDOW_MANAGER_OPTIONS="--replace"
+
+# X11 Compositor Settings
+# Leave empty to disable.
+
+WINDOW_COMPOSITOR=""
+WINDOW_COMPOSITOR_OPTIONS=""
+
+# FLWM menu support
+
+FLWM_MENU_SCRIPT="/usr/bin/gen-flwm-menu.sh"
+
+# X11 Dock/Panel Settings
+X11_DOCK_CMD="mdeon-panel"
+X11_DOCK_CMD_OPTIONS=""
+
+# ==========================================================
+# WAYLAND SESSION CONFIGURATION
+# ==========================================================
+
+WAYLAND_SESSION_SCRIPT_PATH="/usr/bin/mdeon-session"
+
+# Wayland Compositor Settings
+# Examples: labwc, sway, wayfire, hyprland
+
+WAYLAND_COMPOSITOR="labwc"
+WAYLAND_COMPOSITOR_OPTIONS=""
+
+# Desktop Environment Name
+# Used for XDG_CURRENT_DESKTOP in Wayland mode.
+
+WAYLAND_DESKTOP_NAME="wlroots"
+
+# Wayland Desktop Manager Settings
+# The session script skips launching the manager when its command is empty.
+
+WAYLAND_DESKTOP_MANAGER="mdeon-desktop"
+WAYLAND_DESKTOP_MANAGER_OPTIONS=""
+WAYLAND_USE_DESKTOP_MANAGER="true"
+
+# Wayland menu fallback
+
+MENU_SCRIPT="/usr/bin/gen-wayland-menu.sh"
+
+# Wayland Dock/Panel Settings
+WAYLAND_DOCK_CMD="mdeon-panel"
+WAYLAND_DOCK_CMD_OPTIONS=""
+
+# ==========================================================
+# DEBUG CONFIGURATION
+# ==========================================================
+
+DEBUG_LOG_DIR=""
+DEBUG_LOG_MAX_FILES="5"

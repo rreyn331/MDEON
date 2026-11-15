@@ -1,0 +1,1251 @@
+#!/usr/bin/env bash
+
+# ==========================================================
+# MDEON — Minimal Desktop Environment, Optimized for Needs
+# Unified X11 / Wayland session launcher (Init-Agnostic & Stable)
+# ==========================================================
+
+set -u
+set -o pipefail
+
+# ==========================================================
+# SESSION MODE / CONTROL ACTION
+# ==========================================================
+
+CONTROL_ACTION=""
+SESSION_MODE="${1:-}"
+
+case "$SESSION_MODE" in
+    --logout|logout)
+        CONTROL_ACTION="logout"
+        SESSION_MODE="${MDEON_SESSION_TYPE:-${XDG_SESSION_TYPE:-wayland}}"
+        case "$SESSION_MODE" in
+            x11|wayland) ;;
+            *) SESSION_MODE="wayland" ;;
+        esac
+        ;;
+    x11|--x11)
+        SESSION_MODE="x11"
+        ;;
+    wayland|--wayland)
+        SESSION_MODE="wayland"
+        ;;
+    "")
+        SESSION_MODE="${MDEON_SESSION_TYPE:-${XDG_SESSION_TYPE:-x11}}"
+        case "$SESSION_MODE" in
+            x11|wayland) ;;
+            *) SESSION_MODE="x11" ;;
+        esac
+        ;;
+    *)
+        echo "Usage: mdeon-session [x11|wayland|--logout]" >&2
+        exit 1
+        ;;
+esac
+
+# ==========================================================
+# PATHS
+# ==========================================================
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mdeon"
+CONFIG_FILE="$CONFIG_DIR/mdeon.conf"
+DEFAULT_CONFIG="/etc/mdeon/mdeon.conf.default"
+
+RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp/mdeon-$USER}"
+RUNTIME_DIR="$RUNTIME_BASE/session-$SESSION_MODE"
+
+mkdir -p "$CONFIG_DIR" "$RUNTIME_BASE" "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_BASE" "$RUNTIME_DIR" 2>/dev/null || true
+
+READY_FILE="$RUNTIME_DIR/session_ready"
+SESSION_PID_FILE="$RUNTIME_DIR/session.pid"
+WAYLAND_COMPOSITOR_PID_FILE="$RUNTIME_DIR/wayland-compositor.pid"
+X11_WINDOW_MANAGER_PID_FILE="$RUNTIME_DIR/x11-window-manager.pid"
+LOGOUT_REQUEST_FILE="$RUNTIME_DIR/logout.request"
+
+# ==========================================================
+# LOGGING
+# ==========================================================
+
+USER_LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/mdeon/logs"
+mkdir -p "$USER_LOG_DIR"
+
+LOG_TARGET="$USER_LOG_DIR"
+DEBUG_LOG_MAX_FILES="${DEBUG_LOG_MAX_FILES:-5}"
+DEBUG_LOG="$LOG_TARGET/mdeon-${SESSION_MODE}_$(date +%s).log"
+
+log() {
+    local timestamp
+    timestamp="$(date '+%H:%M:%S')"
+    echo "[$timestamp] $*"
+}
+
+update_session_environment() {
+    local -a variables=("$@")
+
+    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        if ! dbus-update-activation-environment "${variables[@]}"; then
+            log "WARNING: Failed to update the D-Bus activation environment."
+        fi
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 \
+        && systemctl --user show-environment >/dev/null 2>&1; then
+        if ! systemctl --user import-environment "${variables[@]}"; then
+            log "WARNING: Failed to import the session environment into systemd."
+        fi
+    fi
+}
+
+log_wayland_environment() {
+    local label="$1"
+
+    log "Wayland environment ($label):"
+    log "  UID/GID:              $(id -u)/$(id -g)"
+    log "  XDG_SESSION_TYPE:     ${XDG_SESSION_TYPE:-<unset>}"
+    log "  XDG_CURRENT_DESKTOP:  ${XDG_CURRENT_DESKTOP:-<unset>}"
+    log "  XDG_SESSION_DESKTOP:  ${XDG_SESSION_DESKTOP:-<unset>}"
+    log "  XDG_RUNTIME_DIR:      ${XDG_RUNTIME_DIR:-<unset>}"
+    log "  WAYLAND_DISPLAY:      ${WAYLAND_DISPLAY:-<unset>}"
+    log "  DISPLAY:              ${DISPLAY:-<unset>}"
+    log "  XDG_SEAT / XDG_VTNR:  ${XDG_SEAT:-<unset>} / ${XDG_VTNR:-<unset>}"
+    log "  D-Bus session bus:    $([[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && echo set || echo unset)"
+}
+
+exec 1> >(tee -a "$DEBUG_LOG")
+exec 2>&1
+
+log "========== MDEON ${SESSION_MODE} session startup =========="
+log "Runtime dir:  $RUNTIME_DIR"
+log "Log file:     $DEBUG_LOG"
+
+# ==========================================================
+# EXTERNAL LOGOUT REQUEST
+# ==========================================================
+
+request_logout() {
+    local mode="${SESSION_MODE:-wayland}"
+    local base="${XDG_RUNTIME_DIR:-/tmp/mdeon-$USER}"
+    local dirs=()
+
+    dirs+=("$base/session-$mode")
+
+    [[ "$mode" != "wayland" ]] && dirs+=("$base/session-wayland")
+    [[ "$mode" != "x11" ]] && dirs+=("$base/session-x11")
+
+    for dir in "${dirs[@]}"; do
+        local pid_file="$dir/session.pid"
+        local req_file="$dir/logout.request"
+
+        if [[ -f "$pid_file" ]]; then
+            local pid
+            pid="$(cat "$pid_file" 2>/dev/null || true)"
+
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                echo "logout" > "$req_file" 2>/dev/null || true
+                log "Requesting logout from MDEON session PID $pid"
+                kill -TERM "$pid" 2>/dev/null || true
+                exit 0
+            fi
+        fi
+    done
+
+    if [[ -n "${XDG_SESSION_ID:-}" ]] && command -v loginctl >/dev/null 2>&1; then
+        log "No MDEON PID file found. Terminating current loginctl session: $XDG_SESSION_ID"
+        loginctl terminate-session "$XDG_SESSION_ID"
+        exit 0
+    fi
+
+    echo "mdeon-session: no running MDEON session found to logout" >&2
+    exit 1
+}
+
+if [[ "$CONTROL_ACTION" == "logout" ]]; then
+    request_logout
+fi
+
+# ==========================================================
+# CONFIG LOAD
+# ==========================================================
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    if [[ -f "$DEFAULT_CONFIG" ]]; then
+        cp "$DEFAULT_CONFIG" "$CONFIG_FILE"
+        chmod 644 "$CONFIG_FILE"
+    else
+        echo "ERROR: Default config not found at $DEFAULT_CONFIG" >&2
+        exit 1
+    fi
+fi
+
+if ! source "$CONFIG_FILE"; then
+    echo "ERROR: Failed to source config file: $CONFIG_FILE" >&2
+    exit 1
+fi
+
+if [[ -x "/usr/bin/mdeon-session-visibility" ]]; then
+    "/usr/bin/mdeon-session-visibility" || true
+fi
+
+log "Config file: $CONFIG_FILE"
+
+# ==========================================================
+# GLOBAL STATE
+# ==========================================================
+
+MDEON_MAIN_PID="$$"
+
+WINDOW_MANAGER_PID=""
+X11_COMPOSITOR_PID=""
+WAYLAND_COMPOSITOR_PID=""
+WALLPAPER_PID=""
+DESKTOP_MANAGER_PID=""
+AUTOSTART_PID=""
+VOLUME_PID=""
+DOCK_PID=""
+MENU_PID=""
+TEMP_COMP_PID=""
+SESSION_MASTER_PID=""
+
+IS_MUTTER=false
+
+ACTIVE_DESKTOP_MANAGER=""
+ACTIVE_DESKTOP_MANAGER_OPTIONS=""
+ACTIVE_USE_DESKTOP_MANAGER="false"
+
+ACTIVE_DOCK_CMD=""
+ACTIVE_DOCK_CMD_OPTIONS=""
+
+ACTIVE_VOLUME=""
+ACTIVE_VOLUME_OPTIONS=""
+ACTIVE_USE_VOLUME="false"
+
+# ==========================================================
+# BACKEND SETTING RESOLUTION
+# ==========================================================
+
+resolve_backend_settings() {
+    case "$SESSION_MODE" in
+        x11)
+            ACTIVE_DESKTOP_MANAGER="${X11_DESKTOP_MANAGER:-${DESKTOP_MANAGER:-}}"
+            ACTIVE_DESKTOP_MANAGER_OPTIONS="${X11_DESKTOP_MANAGER_OPTIONS:-${DESKTOP_MANAGER_OPTIONS:-}}"
+            ACTIVE_USE_DESKTOP_MANAGER="${X11_USE_DESKTOP_MANAGER:-${USE_DESKTOP_MANAGER:-false}}"
+
+            ACTIVE_DOCK_CMD="${X11_DOCK_CMD:-${DOCK_CMD:-}}"
+            ACTIVE_DOCK_CMD_OPTIONS="${X11_DOCK_CMD_OPTIONS:-${DOCK_CMD_OPTIONS:-}}"
+
+            ACTIVE_VOLUME="${X11_VOLUME:-${VOLUME:-}}"
+            ACTIVE_VOLUME_OPTIONS="${X11_VOLUME_OPTIONS:-${VOLUME_OPTIONS:-}}"
+            ACTIVE_USE_VOLUME="${X11_USE_VOLUME:-${USE_VOLUME:-false}}"
+            ;;
+        wayland)
+            ACTIVE_DESKTOP_MANAGER="${WAYLAND_DESKTOP_MANAGER:-${DESKTOP_MANAGER:-}}"
+            ACTIVE_DESKTOP_MANAGER_OPTIONS="${WAYLAND_DESKTOP_MANAGER_OPTIONS:-${DESKTOP_MANAGER_OPTIONS:-}}"
+            ACTIVE_USE_DESKTOP_MANAGER="${WAYLAND_USE_DESKTOP_MANAGER:-${USE_DESKTOP_MANAGER:-false}}"
+
+            ACTIVE_DOCK_CMD="${WAYLAND_DOCK_CMD:-${DOCK_CMD:-}}"
+            ACTIVE_DOCK_CMD_OPTIONS="${WAYLAND_DOCK_CMD_OPTIONS:-${DOCK_CMD_OPTIONS:-}}"
+
+            ACTIVE_VOLUME="${WAYLAND_VOLUME:-${VOLUME:-}}"
+            ACTIVE_VOLUME_OPTIONS="${WAYLAND_VOLUME_OPTIONS:-${VOLUME_OPTIONS:-}}"
+            ACTIVE_USE_VOLUME="${WAYLAND_USE_VOLUME:-${USE_VOLUME:-false}}"
+            ;;
+    esac
+
+    log "Resolved backend settings:"
+    log "  Desktop manager enabled: ${ACTIVE_USE_DESKTOP_MANAGER:-false}"
+    log "  Desktop manager:         ${ACTIVE_DESKTOP_MANAGER:-<none>}"
+    log "  Dock/panel:              ${ACTIVE_DOCK_CMD:-<none>}"
+    log "  Volume enabled:          ${ACTIVE_USE_VOLUME:-false}"
+    log "  Volume program:          ${ACTIVE_VOLUME:-<none>}"
+}
+
+resolve_backend_settings
+
+# ==========================================================
+# UTILS / CLEANUP
+# ==========================================================
+
+cleanup_old_logs() {
+    local count
+    count="$(ls -1 "$LOG_TARGET"/mdeon-"$SESSION_MODE"_*.log 2>/dev/null | wc -l || true)"
+
+    if (( count > DEBUG_LOG_MAX_FILES )); then
+        ls -t "$LOG_TARGET"/mdeon-"$SESSION_MODE"_*.log 2>/dev/null \
+            | tail -n +$((DEBUG_LOG_MAX_FILES + 1)) \
+            | xargs -r rm -f
+    fi
+}
+
+kill_pid() {
+    local pid="${1:-}"
+    local label="${2:-process}"
+
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        log "Stopping $label PID $pid"
+        kill -TERM "$pid" 2>/dev/null || true
+    fi
+}
+
+force_kill_pid() {
+    local pid="${1:-}"
+    local label="${2:-process}"
+
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        log "Force stopping $label PID $pid"
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+}
+
+cleanup() {
+    trap - EXIT INT TERM HUP QUIT
+
+    log "=== Cleanup started ==="
+
+    pkill -f "sleep.*xwallpaper" 2>/dev/null || true
+
+    kill_pid "$MENU_PID" "menu"
+    kill_pid "$DOCK_PID" "dock/panel"
+    kill_pid "$SESSION_MASTER_PID" "session master"
+    kill_pid "$VOLUME_PID" "volume"
+    kill_pid "$AUTOSTART_PID" "autostart manager"
+    kill_pid "$WALLPAPER_PID" "wallpaper"
+    kill_pid "$DESKTOP_MANAGER_PID" "desktop manager"
+    kill_pid "$X11_COMPOSITOR_PID" "X11 compositor"
+    kill_pid "$TEMP_COMP_PID" "temporary compositor"
+
+    sleep 0.5
+
+    force_kill_pid "$MENU_PID" "menu"
+    force_kill_pid "$DOCK_PID" "dock/panel"
+    force_kill_pid "$SESSION_MASTER_PID" "session master"
+    force_kill_pid "$VOLUME_PID" "volume"
+    force_kill_pid "$AUTOSTART_PID" "autostart manager"
+    force_kill_pid "$WALLPAPER_PID" "wallpaper"
+    force_kill_pid "$DESKTOP_MANAGER_PID" "desktop manager"
+    force_kill_pid "$X11_COMPOSITOR_PID" "X11 compositor"
+    force_kill_pid "$TEMP_COMP_PID" "temporary compositor"
+
+    if [[ -n "${WAYLAND_COMPOSITOR_PID:-}" ]]; then
+        kill_pid "$WAYLAND_COMPOSITOR_PID" "Wayland compositor"
+        wait "$WAYLAND_COMPOSITOR_PID" 2>/dev/null || true
+    fi
+
+    if [[ -n "${WINDOW_MANAGER_PID:-}" ]]; then
+        kill_pid "$WINDOW_MANAGER_PID" "X11 window manager"
+        wait "$WINDOW_MANAGER_PID" 2>/dev/null || true
+    fi
+
+    rm -f "$READY_FILE"
+    rm -f "$SESSION_PID_FILE"
+    rm -f "$WAYLAND_COMPOSITOR_PID_FILE"
+    rm -f "$X11_WINDOW_MANAGER_PID_FILE"
+    rm -f "$LOGOUT_REQUEST_FILE"
+    rm -rf "$RUNTIME_DIR"
+
+    cleanup_old_logs
+
+    log "=== Session ended ==="
+    exit 0
+}
+
+echo "$MDEON_MAIN_PID" > "$SESSION_PID_FILE"
+trap cleanup EXIT INT TERM HUP QUIT
+
+find_terminal() {
+    command -v "${FALLBACK_TERM:-}" 2>/dev/null \
+        || command -v foot 2>/dev/null \
+        || command -v alacritty 2>/dev/null \
+        || command -v kitty 2>/dev/null \
+        || command -v x-terminal-emulator 2>/dev/null \
+        || command -v xterm 2>/dev/null \
+        || echo ""
+}
+
+run_fallback_terminal_master() {
+    local msg="${1:-MDEON fallback terminal. Closing this terminal ends the session.}"
+    local term
+
+    term="$(find_terminal)"
+
+    if [[ -z "$term" ]]; then
+        log "CRITICAL: No fallback terminal found. Sleeping forever."
+        while true; do sleep 3600; done
+    fi
+
+    log "Session master: fallback terminal: $term"
+
+    "$term" -e bash -c "echo '------------------------------------------------'; \
+        echo \"$msg\"; \
+        echo 'NOTE: IF THIS TERMINAL CLOSES, THE SESSION ENDS.'; \
+        echo '------------------------------------------------'; \
+        exec bash" &
+    SESSION_MASTER_PID=$!
+
+    wait "$SESSION_MASTER_PID" 2>/dev/null || true
+}
+
+# ==========================================================
+# WALLPAPER
+# ==========================================================
+
+autodetect_wallpaper() {
+    local detected=""
+    local uid
+    uid="$(id -u)"
+
+    detected="$(dbus-send --system --print-reply \
+        --dest=org.freedesktop.Accounts \
+        "/org/freedesktop/Accounts/User${uid}" \
+        org.freedesktop.DBus.Properties.Get \
+        string:"org.freedesktop.DisplayManager.AccountsService" \
+        string:"BackgroundFile" 2>/dev/null \
+        | grep -o '"[^"]*"' | tr -d '"' | head -n 1 || true)"
+
+    if [[ -z "$detected" ]] && command -v xfconf-query >/dev/null 2>&1; then
+        local prop
+        prop="$(xfconf-query -c xfce4-desktop -l 2>/dev/null | grep last-image | head -n 1 || true)"
+        [[ -n "$prop" ]] && detected="$(xfconf-query -c xfce4-desktop -p "$prop" 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$detected" ]] && command -v gsettings >/dev/null 2>&1; then
+        detected="$(gsettings get org.gnome.desktop.background picture-uri 2>/dev/null | sed "s/^'file:\/\///;s/'$//" || true)"
+        [[ -z "$detected" ]] && detected="$(gsettings get org.cinnamon.desktop.background picture-uri 2>/dev/null | sed "s/^'file:\/\///;s/'$//" || true)"
+        [[ -z "$detected" ]] && detected="$(gsettings get org.mate.background picture-filename 2>/dev/null | sed "s/^'//;s/'$//" || true)"
+    fi
+
+    if [[ -z "$detected" && -f /etc/lightdm/slick-greeter.conf ]]; then
+        detected="$(grep "^background=" /etc/lightdm/slick-greeter.conf | cut -d= -f2- | head -n 1 || true)"
+    fi
+
+    [[ -n "$detected" && -f "$detected" ]] && echo "$detected"
+}
+
+ensure_wallpaper_value() {
+    if [[ -z "${WALLPAPER:-}" ]]; then
+        log "No wallpaper configured. Trying autodetection."
+        local found
+        found="$(autodetect_wallpaper || true)"
+
+        if [[ -n "$found" ]]; then
+            WALLPAPER="$found"
+            log "Autodetected wallpaper: $WALLPAPER"
+        else
+            log "No wallpaper autodetected."
+        fi
+    fi
+}
+
+# ==========================================================
+# SHARED LAUNCHERS
+# ==========================================================
+
+wait_for_gnome_shell_extension() {
+    local attempts=100
+    local result
+
+    [[ "$IS_MUTTER" == "true" ]] || return 0
+    command -v gdbus >/dev/null 2>&1 || {
+        log "WARNING: gdbus unavailable; cannot wait for the GNOME panel extension."
+        return 0
+    }
+
+    log "Waiting for the GNOME panel extension before launching the desktop."
+    while (( attempts > 0 )); do
+        if result="$(gdbus call --session \
+            --dest org.freedesktop.DBus \
+            --object-path /org/freedesktop/DBus \
+            --method org.freedesktop.DBus.NameHasOwner \
+            org.mdeon.Panel.WindowManager 2>/dev/null)" \
+            && [[ "$result" == *"(true,"* ]]; then
+            log "GNOME panel extension is ready."
+            return 0
+        fi
+
+        sleep 0.1
+        attempts=$((attempts - 1))
+    done
+
+    log "WARNING: GNOME panel extension did not become ready; continuing desktop startup."
+}
+
+launch_desktop_manager() {
+    log "--- Desktop manager setup ---"
+    [[ "${ACTIVE_USE_DESKTOP_MANAGER:-false}" != "true" ]] && {
+        log "Desktop manager disabled."
+        return 0
+    }
+    [[ -z "${ACTIVE_DESKTOP_MANAGER:-}" ]] && {
+        log "Desktop manager enabled but not configured."
+        return 0
+    }
+    command -v "$ACTIVE_DESKTOP_MANAGER" >/dev/null 2>&1 || {
+        log "Desktop manager not found: $ACTIVE_DESKTOP_MANAGER"
+        return 0
+    }
+    wait_for_gnome_shell_extension
+    log "Launching desktop manager: $ACTIVE_DESKTOP_MANAGER ${ACTIVE_DESKTOP_MANAGER_OPTIONS:-}"
+    "$ACTIVE_DESKTOP_MANAGER" ${ACTIVE_DESKTOP_MANAGER_OPTIONS:-} &
+    DESKTOP_MANAGER_PID=$!
+    sleep 1
+}
+
+launch_autostart() {
+    log "--- Autostart setup ---"
+
+    local manager="${AUTOSTART_MANAGER:-mdeon-autostart}"
+    local options="${AUTOSTART_MANAGER_OPTIONS:-}"
+
+    if [[ "${AUTOSTART_MODE:-sequential}" == "parallel" ]]; then
+        options="--session-parallel"
+    elif [[ -z "$options" ]]; then
+        options="--session"
+    fi
+
+    if command -v "$manager" >/dev/null 2>&1 || [[ -x "$manager" ]]; then
+        log "Launching autostart manager: $manager $options"
+        "$manager" $options &
+        AUTOSTART_PID=$!
+    else
+        log "Autostart manager not found: $manager"
+    fi
+}
+
+should_launch_volume() {
+    local volume_exec="$1"
+    local base
+    local override
+    local system_file
+
+    base="$(basename "$volume_exec")"
+    override="$HOME/.config/autostart/${base}.desktop"
+    system_file="/etc/xdg/autostart/${base}.desktop"
+
+    [[ ! -f "$system_file" ]] && return 0
+
+    if [[ -f "$override" ]]; then
+        grep -q "^Hidden=true" "$override" && return 0
+        return 1
+    fi
+
+    return 1
+}
+
+launch_volume() {
+    log "--- Volume setup ---"
+
+    [[ "${ACTIVE_USE_VOLUME:-false}" != "true" ]] && {
+        log "Volume applet disabled."
+        return 0
+    }
+
+    [[ -z "${ACTIVE_VOLUME:-}" ]] && {
+        log "Volume enabled but no volume program configured."
+        return 0
+    }
+
+    command -v "$ACTIVE_VOLUME" >/dev/null 2>&1 || {
+        log "Volume program not found: $ACTIVE_VOLUME"
+        return 0
+    }
+
+    if ! should_launch_volume "$ACTIVE_VOLUME"; then
+        log "Volume applet appears managed by XDG autostart. Skipping."
+        return 0
+    fi
+
+    log "Launching volume applet: $ACTIVE_VOLUME ${ACTIVE_VOLUME_OPTIONS:-}"
+    "$ACTIVE_VOLUME" ${ACTIVE_VOLUME_OPTIONS:-} &
+    VOLUME_PID=$!
+}
+
+apply_display_settings() {
+    if [[ "$SESSION_MODE" == "wayland" && "$IS_MUTTER" == "true" ]]; then
+        log "Skipping saved display profile: GNOME/Mutter manages display settings."
+        return 0
+    fi
+
+    if [[ "$SESSION_MODE" == "wayland" && "$(basename "${WAYLAND_COMPOSITOR:-}")" == "kwin_wayland" ]]; then
+        log "Skipping saved display profile: KWin has no supported display-settings backend."
+        return 0
+    fi
+
+    if command -v mdeon-display-settings >/dev/null 2>&1; then
+        local -a display_args=(--apply)
+        local max_attempts=1
+        local attempt=1
+
+        if [[ "$SESSION_MODE" == "wayland" && "$(basename "${WAYLAND_COMPOSITOR:-}")" == "labwc" ]]; then
+            display_args=(--display-backend wlr-randr --apply)
+            max_attempts=5
+            log "Applying saved display profile with labwc's wlr-randr backend."
+        else
+            log "Applying display settings with mdeon-display-settings --apply"
+        fi
+
+        while (( attempt <= max_attempts )); do
+            if mdeon-display-settings "${display_args[@]}"; then
+                log "Display settings applied."
+                return 0
+            else
+                local status=$?
+                log "WARNING: Display settings attempt $attempt/$max_attempts failed with status $status."
+            fi
+
+            if (( attempt < max_attempts )); then
+                sleep 1
+            fi
+            attempt=$((attempt + 1))
+        done
+
+        log "WARNING: Unable to apply the saved display profile."
+    else
+        log "mdeon-display-settings not found; skipping display apply"
+    fi
+
+    return 0
+}
+
+# ==========================================================
+# X11 BACKEND (Init-Agnostic & Stable)
+# ==========================================================
+
+wait_for_x11_wm_ready() {
+    local timeout="${1:-15}"
+    local elapsed=0
+
+    log "Waiting for X11 window manager readiness."
+
+    while (( elapsed < timeout )); do
+        if command -v xprop >/dev/null 2>&1 && xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1; then
+            touch "$READY_FILE"
+            log "X11 window manager is ready."
+            return 0
+        fi
+
+        kill -0 "$WINDOW_MANAGER_PID" 2>/dev/null || return 1
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    return 1
+}
+
+launch_x11_window_manager() {
+    log "--- X11 window manager launch ---"
+
+    while [[ -z "${WINDOW_MANAGER:-}" ]] || ! command -v "$WINDOW_MANAGER" >/dev/null 2>&1; do
+        log "ERROR: X11 window manager not found: ${WINDOW_MANAGER:-<empty>}"
+
+        if command -v mdeon-settings >/dev/null 2>&1; then
+            mdeon-settings || true
+            source "$CONFIG_FILE"
+            resolve_backend_settings
+        else
+            run_fallback_terminal_master "MDEON ERROR: No X11 window manager configured."
+            cleanup
+        fi
+    done
+
+    log "Launching X11 WM: $WINDOW_MANAGER ${WINDOW_MANAGER_OPTIONS:-}"
+    "$WINDOW_MANAGER" ${WINDOW_MANAGER_OPTIONS:-} &
+    WINDOW_MANAGER_PID=$!
+    echo "$WINDOW_MANAGER_PID" > "$X11_WINDOW_MANAGER_PID_FILE"
+
+    wait_for_x11_wm_ready 15 || log "WARNING: X11 WM did not signal readiness."
+
+    (
+        while kill -0 "$WINDOW_MANAGER_PID" 2>/dev/null; do
+            sleep 2
+        done
+
+        log "X11 window manager exited. Session will remain alive until explicitly terminated."
+    ) &
+}
+
+launch_x11_compositor() {
+    log "--- X11 compositor setup ---"
+
+    [[ -z "${WINDOW_COMPOSITOR:-}" ]] && {
+        log "X11 compositor disabled."
+        return 0
+    }
+
+    command -v "$WINDOW_COMPOSITOR" >/dev/null 2>&1 || {
+        log "X11 compositor not found: $WINDOW_COMPOSITOR"
+        return 0
+    }
+
+    log "Launching X11 compositor: $WINDOW_COMPOSITOR ${WINDOW_COMPOSITOR_OPTIONS:-}"
+    "$WINDOW_COMPOSITOR" ${WINDOW_COMPOSITOR_OPTIONS:-} &
+    X11_COMPOSITOR_PID=$!
+    sleep 0.5
+}
+
+setup_x11_wallpaper() {
+    log "--- X11 wallpaper setup ---"
+    ensure_wallpaper_value
+
+    if [[ -n "${WALLPAPER:-}" && -f "$WALLPAPER" ]] && command -v xwallpaper >/dev/null 2>&1; then
+        log "Setting X11 wallpaper: $WALLPAPER"
+        pkill -f "sleep.*xwallpaper" 2>/dev/null || true
+        xwallpaper --zoom "$WALLPAPER" 2>/dev/null || true
+        (sleep 2 && xwallpaper --zoom "$WALLPAPER" 2>/dev/null) &
+    else
+        log "Setting X11 fallback color: ${FALLBACK_COLOR:-#222222}"
+        xsetroot -solid "${FALLBACK_COLOR:-#222222}" 2>/dev/null || true
+    fi
+}
+
+setup_x11_flwm_menu() {
+    if [[ "${WINDOW_MANAGER:-}" == "flwm" && -x "${FLWM_MENU_SCRIPT:-}" ]]; then
+        log "Launching FLWM menu: $FLWM_MENU_SCRIPT"
+        "$FLWM_MENU_SCRIPT" &
+        MENU_PID=$!
+    fi
+}
+
+run_x11_session_master() {
+    log "--- X11 session master ---"
+
+    if [[ -n "${ACTIVE_DOCK_CMD:-}" ]] && command -v "$ACTIVE_DOCK_CMD" >/dev/null 2>&1; then
+        log "Session master: $ACTIVE_DOCK_CMD ${ACTIVE_DOCK_CMD_OPTIONS:-}"
+        "$ACTIVE_DOCK_CMD" ${ACTIVE_DOCK_CMD_OPTIONS:-} &
+        DOCK_PID=$!
+
+        while kill -0 "$DOCK_PID" 2>/dev/null; do
+            if [[ -n "${WINDOW_MANAGER_PID:-}" ]] && ! kill -0 "$WINDOW_MANAGER_PID" 2>/dev/null; then
+                log "X11 Window Manager died while dock was running."
+                break
+            fi
+            sleep 1
+        done
+
+        local dock_status=$?
+        log "X11 dock/panel exited with status: ${dock_status:-0}."
+        log "Session will continue without the dock/panel."
+    else
+        run_fallback_terminal_master "MDEON X11 fallback terminal."
+    fi
+}
+
+setup_x11_environment() {
+    log "--- X11 environment setup (Init-Agnostic) ---"
+    export XDG_SESSION_TYPE="x11"
+    if [[ "$IS_MUTTER" == "true" ]]; then
+        export MDEON_SESSION_COMPOSITOR="gnome-shell"
+    else
+        export MDEON_SESSION_COMPOSITOR=""
+    fi
+    export XDG_CURRENT_DESKTOP="MDEON"
+    export XDG_SESSION_DESKTOP="MDEON"
+    export DESKTOP_SESSION="mdeon"
+
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && command -v dbus-launch >/dev/null 2>&1; then
+        log "Initializing standalone D-Bus session bus for X11..."
+        eval "$(dbus-launch --sh-syntax)"
+    fi
+
+    update_session_environment \
+        DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP DESKTOP_SESSION \
+        MDEON_SESSION_COMPOSITOR
+}
+
+run_x11_session() {
+    log "Starting MDEON X11 backend (Init-Agnostic & Stable)."
+
+    setup_x11_environment
+    apply_display_settings
+
+    launch_x11_compositor
+    launch_x11_window_manager
+
+    update_session_environment DISPLAY
+
+    setup_x11_wallpaper
+    launch_desktop_manager
+    setup_x11_flwm_menu
+
+    sleep 0.2
+    launch_volume
+    launch_autostart
+    run_x11_session_master
+}
+
+# ==========================================================
+# WAYLAND BACKEND (Init-Agnostic & Stable)
+# ==========================================================
+
+detect_mutter_environment() {
+    local current="${XDG_CURRENT_DESKTOP:-}"
+    [[ "${current^^}" == *"GNOME"* ]] && return 0
+    [[ "${current^^}" == *"PANTHEON"* ]] && return 0
+
+    pgrep -x gnome-shell >/dev/null 2>&1 && return 0
+    pgrep -x mutter >/dev/null 2>&1 && return 0
+
+    [[ "${WAYLAND_COMPOSITOR:-}" == *"mutter"* ]] && return 0
+    [[ "${WAYLAND_COMPOSITOR:-}" == *"gnome-shell"* ]] && return 0
+
+    return 1
+}
+
+disable_gnome_shell_panels() {
+    if ! command -v gsettings >/dev/null 2>&1; then
+        return 0
+    fi
+
+    gsettings set org.gnome.shell disabled-extensions "['dash-to-dock@micahflee.com','ubuntu-dock@ubuntu.com']" 2>/dev/null || true
+    gsettings set org.gnome.shell.extensions.dash-to-dock dock-fixed false 2>/dev/null || true
+    gsettings set org.gnome.shell.extensions.dash-to-dock extend-height false 2>/dev/null || true
+    gsettings set org.gnome.shell.extensions.dash-to-dock show-apps-at-top false 2>/dev/null || true
+
+    log "Disabled GNOME dock extensions before launching the MDEON panel."
+    return 0
+}
+
+setup_wayland_environment() {
+    log "--- Wayland environment setup (Init-Agnostic) ---"
+    log_wayland_environment "inherited"
+
+    export XDG_SESSION_TYPE="wayland"
+
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        export XDG_RUNTIME_DIR="$RUNTIME_BASE"
+        chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+    fi
+
+    if detect_mutter_environment; then
+        IS_MUTTER=true
+        log "Mutter/GNOME environment detected."
+    else
+        IS_MUTTER=false
+    fi
+
+    if [[ "$IS_MUTTER" == "true" ]]; then
+        export MDEON_SESSION_COMPOSITOR="gnome-shell"
+    else
+        export MDEON_SESSION_COMPOSITOR=""
+    fi
+    export XDG_CURRENT_DESKTOP="MDEON"
+    export XDG_SESSION_DESKTOP="MDEON"
+    export DESKTOP_SESSION="mdeon"
+
+    export MOZ_ENABLE_WAYLAND=1
+    export QT_QPA_PLATFORM="wayland;xcb"
+    export GDK_BACKEND="wayland,x11"
+    export SDL_VIDEODRIVER="wayland,x11"
+    export CLUTTER_BACKEND=wayland
+
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && command -v dbus-launch >/dev/null 2>&1; then
+        log "Initializing standalone D-Bus session bus..."
+        eval "$(dbus-launch --sh-syntax)"
+    fi
+
+    update_session_environment \
+        WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE \
+        XDG_SESSION_DESKTOP DESKTOP_SESSION QT_QPA_PLATFORM GDK_BACKEND
+
+    unset DISPLAY
+
+    log_wayland_environment "configured"
+    log "  dbus-update-activation-environment: $(command -v dbus-update-activation-environment 2>/dev/null || echo unavailable)"
+}
+
+wait_for_wayland_ready() {
+    local ticks="${1:-50}"
+    local runtime
+    local socket_path
+    local sock
+    local sockets=()
+
+    log "Waiting for Wayland socket."
+
+    runtime="${XDG_RUNTIME_DIR:-$RUNTIME_BASE}"
+    log "  Runtime directory: $runtime"
+    log "  Initial WAYLAND_DISPLAY: ${WAYLAND_DISPLAY:-<unset>}"
+
+    while true; do
+        if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+            if [[ "$WAYLAND_DISPLAY" = /* ]]; then
+                socket_path="$WAYLAND_DISPLAY"
+            else
+                socket_path="$runtime/$WAYLAND_DISPLAY"
+            fi
+
+            [[ -S "$socket_path" ]] && break
+        fi
+
+        [[ "$ticks" -le 0 ]] && return 1
+
+        sockets=()
+        shopt -s nullglob
+        sockets=( "$runtime"/wayland-[0-9]* )
+        shopt -u nullglob
+
+        for sock in "${sockets[@]}"; do
+            if [[ -S "$sock" ]]; then
+                export WAYLAND_DISPLAY="$(basename "$sock")"
+                break
+            fi
+        done
+
+        if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+            socket_path="$runtime/$WAYLAND_DISPLAY"
+            [[ -S "$socket_path" ]] && break
+        fi
+
+        if [[ -n "${WAYLAND_COMPOSITOR_PID:-}" ]]; then
+            kill -0 "$WAYLAND_COMPOSITOR_PID" 2>/dev/null || return 1
+        else
+            return 1
+        fi
+
+        sleep 0.1
+        ticks=$((ticks - 1))
+    done
+
+    touch "$READY_FILE"
+    log "Wayland ready: WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+    return 0
+}
+
+xwayland_environment_for_session() {
+    local cmdline pid index display authority ancestor parent_pid
+    local -a args=()
+
+    for cmdline in /proc/[0-9]*/cmdline; do
+        [[ -r "$cmdline" ]] || continue
+        pid="${cmdline#/proc/}"
+        pid="${pid%/cmdline}"
+        args=()
+        mapfile -d '' -t args < "$cmdline" 2>/dev/null || true
+        (( ${#args[@]} > 1 )) || continue
+        [[ "${args[0]##*/}" == "Xwayland" ]] || continue
+
+        display=""
+        authority=""
+        for ((index = 1; index < ${#args[@]}; index++)); do
+            if [[ "${args[index]}" =~ ^:[0-9]+(\.[0-9]+)?$ ]]; then
+                display="${args[index]}"
+            fi
+            if [[ "${args[index]}" == "-auth" ]] && (( index + 1 < ${#args[@]} )); then
+                authority="${args[index + 1]}"
+            fi
+        done
+
+        [[ -n "$display" && -n "$authority" && -r "$authority" ]] || continue
+
+        ancestor="$pid"
+        while [[ "$ancestor" =~ ^[0-9]+$ ]] && (( ancestor > 1 )); do
+            parent_pid="$(awk '/^PPid:/ { print $2; exit }' "/proc/$ancestor/status" 2>/dev/null || true)"
+            if [[ "$parent_pid" == "$WAYLAND_COMPOSITOR_PID" ]]; then
+                printf '%s\t%s\n' "$display" "$authority"
+                return 0
+            fi
+            ancestor="$parent_pid"
+        done
+    done
+
+    return 1
+}
+
+wait_for_xwayland_display() {
+    local ticks="${1:-50}"
+    local xwayland_environment
+
+    while (( ticks > 0 )); do
+        if xwayland_environment="$(xwayland_environment_for_session)"; then
+            IFS=$'\t' read -r DISPLAY XAUTHORITY <<< "$xwayland_environment"
+            export DISPLAY XAUTHORITY
+            log "Xwayland ready: DISPLAY=$DISPLAY"
+            log "Xwayland authorization file detected."
+            return 0
+        fi
+
+        [[ -n "${WAYLAND_COMPOSITOR_PID:-}" ]] && kill -0 "$WAYLAND_COMPOSITOR_PID" 2>/dev/null || return 1
+        sleep 0.1
+        ticks=$((ticks - 1))
+    done
+
+    log "WARNING: No new Xwayland display socket appeared."
+    return 1
+}
+
+ensure_wayland_compositor_config() {
+    local comp_cmd
+    comp_cmd="$(basename "$1")"
+
+    local comp_conf_dir="$CONFIG_DIR/$comp_cmd"
+    local conf_file=""
+    local defaults=()
+
+    if [[ "${WAYLAND_COMPOSITOR_OPTIONS:-}" == *"-c "* ]] || [[ "${WAYLAND_COMPOSITOR_OPTIONS:-}" == *"--config "* ]]; then
+        log "Custom compositor config flag detected. Not injecting config."
+        return 0
+    fi
+
+    case "$comp_cmd" in
+        sway)
+            conf_file="$comp_conf_dir/config"
+            defaults=("/etc/sway/config" "/usr/local/etc/sway/config")
+            ;;
+        wayfire)
+            conf_file="$comp_conf_dir/wayfire.ini"
+            defaults=("/usr/share/wayfire/wayfire.ini" "/etc/wayfire/wayfire.ini" "/usr/share/doc/wayfire/wayfire.ini")
+            ;;
+        hyprland|Hyprland)
+            conf_file="$comp_conf_dir/hyprland.conf"
+            defaults=("/usr/share/hyprland/hyprland.conf" "/etc/hyprland/hyprland.conf")
+            ;;
+        weston)
+            conf_file="$comp_conf_dir/weston.ini"
+            defaults=("/etc/xdg/weston/weston.ini")
+            ;;
+        river)
+            conf_file="$comp_conf_dir/init"
+            defaults=("/usr/share/river/example/init" "/etc/river/init")
+            ;;
+        *)
+            log "Compositor '$comp_cmd' will use its default config location."
+            return 0
+            ;;
+    esac
+
+    mkdir -p "$comp_conf_dir"
+
+    if [[ ! -f "$conf_file" ]]; then
+        local copied=false
+
+        for def in "${defaults[@]}"; do
+            if [[ -f "$def" ]]; then
+                cp "$def" "$conf_file"
+                chmod 644 "$conf_file"
+                [[ "$comp_cmd" == "river" ]] && chmod +x "$conf_file"
+                copied=true
+                log "Copied default config for $comp_cmd from $def"
+                break
+            fi
+        done
+
+        if [[ "$copied" == false ]]; then
+            touch "$conf_file"
+            [[ "$comp_cmd" == "river" ]] && chmod +x "$conf_file"
+            log "Created empty config for $comp_cmd at $conf_file"
+        fi
+    fi
+
+    WAYLAND_COMPOSITOR_OPTIONS="-c $conf_file ${WAYLAND_COMPOSITOR_OPTIONS:-}"
+    log "Injected compositor config flag: -c $conf_file"
+}
+
+log_wayland_startup_failure() {
+    local runtime="${XDG_RUNTIME_DIR:-$RUNTIME_BASE}"
+    local compositor_path="${1:-<unknown>}"
+
+    log "Wayland startup diagnostics:"
+    log "  Compositor:           $compositor_path"
+    log "  Compositor options:   ${WAYLAND_COMPOSITOR_OPTIONS:-<none>}"
+    log "  Runtime directory:    $runtime"
+    log "  Runtime directory permissions: $(stat -c '%A %a %U:%G' "$runtime" 2>/dev/null || echo unavailable)"
+    log_wayland_environment "at compositor startup failure"
+
+    if [[ -d "$runtime" ]]; then
+        log "  Runtime directory contents:"
+        ls -la "$runtime" 2>&1 | while IFS= read -r line; do log "    $line"; done
+    else
+        log "  Runtime directory does not exist."
+    fi
+
+    if [[ -n "${WAYLAND_COMPOSITOR_PID:-}" ]]; then
+        log "  Compositor PID:       $WAYLAND_COMPOSITOR_PID"
+        ps -o pid,ppid,stat,etime,args -p "$WAYLAND_COMPOSITOR_PID" 2>&1 \
+            | while IFS= read -r line; do log "    $line"; done
+        if ! kill -0 "$WAYLAND_COMPOSITOR_PID" 2>/dev/null; then
+            local compositor_status
+            if wait "$WAYLAND_COMPOSITOR_PID" 2>/dev/null; then
+                compositor_status=0
+            else
+                compositor_status=$?
+            fi
+            log "  Compositor exit status: $compositor_status"
+        else
+            log "  Compositor process is still running."
+        fi
+    fi
+}
+
+launch_wayland_compositor() {
+    log "--- Wayland compositor launch ---"
+
+    local compositor="${WAYLAND_COMPOSITOR:-labwc}"
+
+    if [[ "$(basename "$compositor")" == "kwin_wayland" ]]; then
+        if command -v kwin_wayland_wrapper >/dev/null 2>&1; then
+            compositor="$(command -v kwin_wayland_wrapper)"
+            log "Using the KWin session wrapper."
+        fi
+
+        if [[ " ${WAYLAND_COMPOSITOR_OPTIONS:-} " != *" --xwayland "* ]]; then
+            WAYLAND_COMPOSITOR_OPTIONS="${WAYLAND_COMPOSITOR_OPTIONS:-} --xwayland"
+        fi
+    fi
+
+    while true; do
+        if [[ -n "$compositor" ]] && command -v "$compositor" >/dev/null 2>&1; then
+            break
+        fi
+
+        log "ERROR: Wayland compositor not found: ${compositor:-<empty>}"
+
+        if command -v mdeon-settings >/dev/null 2>&1; then
+            mdeon-settings || true
+            source "$CONFIG_FILE"
+            resolve_backend_settings
+            compositor="${WAYLAND_COMPOSITOR:-labwc}"
+        else
+            run_fallback_terminal_master "MDEON ERROR: No Wayland compositor configured."
+            cleanup
+        fi
+    done
+
+    ensure_wayland_compositor_config "$compositor"
+
+    log "Launching Wayland compositor: $compositor ${WAYLAND_COMPOSITOR_OPTIONS:-}"
+    log "Resolved compositor executable: $(command -v "$compositor" 2>/dev/null || echo unavailable)"
+    "$compositor" ${WAYLAND_COMPOSITOR_OPTIONS:-} &
+    WAYLAND_COMPOSITOR_PID=$!
+    echo "$WAYLAND_COMPOSITOR_PID" > "$WAYLAND_COMPOSITOR_PID_FILE"
+
+    if ! wait_for_wayland_ready 50; then
+        log "CRITICAL: Wayland compositor failed to create a socket within 5 seconds."
+        log_wayland_startup_failure "$compositor"
+        cleanup
+    fi
+}
+
+monitor_wayland_compositor() {
+    (
+        while [[ -n "${WAYLAND_COMPOSITOR_PID:-}" ]] && kill -0 "$WAYLAND_COMPOSITOR_PID" 2>/dev/null; do
+            sleep 0.5
+        done
+
+        log "Wayland compositor exited. Session will remain alive until explicitly terminated."
+    ) &
+}
+
+setup_wayland_wallpaper() {
+    log "--- Wayland wallpaper setup ---"
+    ensure_wallpaper_value
+
+    if command -v swaybg >/dev/null 2>&1; then
+        if [[ -n "${WALLPAPER:-}" && -f "$WALLPAPER" ]]; then
+            log "Setting Wayland wallpaper: $WALLPAPER"
+            swaybg -i "$WALLPAPER" -m fill &
+        else
+            log "Setting Wayland fallback color: ${FALLBACK_COLOR:-#222222}"
+            swaybg -c "${FALLBACK_COLOR:-#222222}" -m solid_color &
+        fi
+
+        WALLPAPER_PID=$!
+    else
+        log "swaybg not found. Background left to compositor/default."
+    fi
+}
+
+launch_wayland_menu_if_needed() {
+    log "--- Wayland menu fallback check ---"
+
+    if [[ -n "${ACTIVE_DOCK_CMD:-}" ]] && command -v "$ACTIVE_DOCK_CMD" >/dev/null 2>&1; then
+        log "Dock/panel exists. Skipping MENU_SCRIPT."
+        return 0
+    fi
+
+    if [[ -x "${MENU_SCRIPT:-}" ]]; then
+        log "Launching menu script: $MENU_SCRIPT"
+        "$MENU_SCRIPT" &
+        MENU_PID=$!
+    fi
+}
+
+run_wayland_session_master() {
+    log "--- Wayland session master ---"
+
+    unset DESKTOP_STARTUP_ID
+    unset GIO_LAUNCHED_DESKTOP_FILE
+    unset XDG_ACTIVATION_TOKEN
+
+    if [[ "$IS_MUTTER" == "true" ]]; then
+        disable_gnome_shell_panels
+    fi
+
+    if [[ -n "${ACTIVE_DOCK_CMD:-}" ]] && command -v "$ACTIVE_DOCK_CMD" >/dev/null 2>&1; then
+        log "Session master: $ACTIVE_DOCK_CMD ${ACTIVE_DOCK_CMD_OPTIONS:-}"
+        "$ACTIVE_DOCK_CMD" ${ACTIVE_DOCK_CMD_OPTIONS:-} &
+        DOCK_PID=$!
+
+        while true; do
+            if [[ -n "${WAYLAND_COMPOSITOR_PID:-}" ]] && ! kill -0 "$WAYLAND_COMPOSITOR_PID" 2>/dev/null; then
+                log "Wayland compositor exited while dock/panel was running."
+                break
+            fi
+
+            if [[ -n "${DOCK_PID:-}" ]] && ! kill -0 "$DOCK_PID" 2>/dev/null; then
+                local dock_status
+
+                wait "$DOCK_PID" 2>/dev/null
+                dock_status=$?
+
+                log "Wayland dock/panel exited with status: $dock_status"
+                run_fallback_terminal_master "MDEON Wayland panel failed to start. Closing this terminal ends the session."
+                break
+            fi
+
+            sleep 0.5
+        done
+    else
+        run_fallback_terminal_master "MDEON Wayland fallback terminal."
+    fi
+}
+
+run_wayland_session() {
+    log "Starting MDEON Wayland backend (Init-Agnostic & Stable)."
+
+    setup_wayland_environment
+    launch_wayland_compositor
+    apply_display_settings
+    wait_for_xwayland_display 100 || true
+    monitor_wayland_compositor
+
+    local activation_vars=(WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE)
+    activation_vars+=(XDG_SESSION_DESKTOP DESKTOP_SESSION QT_QPA_PLATFORM GDK_BACKEND)
+    activation_vars+=(MDEON_SESSION_COMPOSITOR)
+    [[ -n "${DISPLAY:-}" ]] && activation_vars+=(DISPLAY)
+    [[ -n "${XAUTHORITY:-}" ]] && activation_vars+=(XAUTHORITY)
+    update_session_environment "${activation_vars[@]}"
+
+    setup_wayland_wallpaper
+    launch_desktop_manager
+    launch_wayland_menu_if_needed
+
+    sleep 0.2
+    launch_volume
+    launch_autostart
+    run_wayland_session_master
+}
+
+# ==========================================================
+# MAIN
+# ==========================================================
+
+case "$SESSION_MODE" in
+    x11)
+        run_x11_session
+        ;;
+    wayland)
+        run_wayland_session
+        ;;
+esac
+
+log "Session master exited."
+cleanup

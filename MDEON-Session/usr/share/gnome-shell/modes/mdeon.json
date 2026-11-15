@@ -1,0 +1,17 @@
+{
+  "parentMode": null,
+  "stylesheetName": "gnome-shell.css",
+  "hasOverview": false,
+  "allowSettings": false,
+  "hasWindows": true,
+  "hasWorkspaces": true,
+  "enabledExtensions": [
+    "mdeon-panel-window-manager@roy"
+  ],
+  "components": [],
+  "panel": {
+    "left": [],
+    "center": [],
+    "right": []
+  }
+}

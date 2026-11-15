@@ -1,0 +1,958 @@
+#!/usr/bin/env python3
+"""
+MDEON Launch Desktop Manager Dialog (Zero-Toolkit Edition)
+- Rendering: Pure PyCairo
+- Backends: Native Wayland (pywayland layer-shell) + Native X11 (ctypes Xlib)
+- Actions: 'Launch Once' or 'Set as Default' (persisting to ~/.config/mdeon/mdeon.conf)
+- Behavior: Matches launch-panel by presenting the GUI selector upon launch
+"""
+
+import os
+import io
+import mmap
+import re
+import select
+import sys
+import time
+import math
+import shutil
+import signal
+import ctypes
+import subprocess
+import shlex
+import tempfile
+from pathlib import Path
+
+import cairo
+from mdeon_theme import ThemedContext, prefers_light_scheme
+
+# ----------------------------------------------------------------------
+# Process Identification
+# ----------------------------------------------------------------------
+PROCESS_NAME = "launch-desktop"
+sys.argv[0] = PROCESS_NAME
+
+if sys.platform.startswith("linux"):
+    try:
+        libc = ctypes.cdll.LoadLibrary("libc.so.6")
+        libc.prctl(15, PROCESS_NAME.encode("utf-8"), 0, 0, 0)
+    except Exception:
+        try:
+            libc = ctypes.CDLL(None)
+            libc.prctl(15, PROCESS_NAME.encode("utf-8"), 0, 0, 0)
+        except Exception:
+            pass
+
+try:
+    import setproctitle
+    setproctitle.setproctitle(PROCESS_NAME)
+except ImportError:
+    pass
+
+# ----------------------------------------------------------------------
+# Configuration & Constants
+# ----------------------------------------------------------------------
+CONF = Path.home() / ".config/mdeon/mdeon.conf"
+DFLT = Path("/etc/mdeon/mdeon.conf.default")
+
+X11_DESKTOP_CANDIDATES = [
+    "spacefm",
+    "pcmanfm",
+    "caja",
+    "nemo",
+    "mdeon-desktop",
+]
+
+WAYLAND_DESKTOP_CANDIDATES = [
+    "waylandminimal-desktop",
+    "mdeon-desktop",
+    "pcmanfm-qt",
+    "nemo",
+    "caja",
+    "spacefm",
+]
+
+# ----------------------------------------------------------------------
+# Helper Utilities
+# ----------------------------------------------------------------------
+def has(cmd):
+    return shutil.which(cmd) is not None
+
+def session_type():
+    xdg = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
+    if xdg in ("wayland", "x11"):
+        return xdg
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if os.environ.get("DISPLAY"):
+        return "x11"
+    return "x11"
+
+def available(candidates):
+    out = []
+    for item in candidates:
+        if item == "none":
+            out.append(item)
+        elif has(item):
+            out.append(item)
+        elif "/" in item and Path(item).exists():
+            out.append(item)
+    return out
+
+def shell_unquote(value):
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    return value.replace('\\"', '"').replace("\\\\", "\\")
+
+def quote_value(value):
+    value = str(value)
+    value = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{value}"'
+
+def cmd_base(value):
+    value = (value or "").strip()
+    if not value:
+        return ""
+    try:
+        parts = shlex.split(value)
+        if parts:
+            value = parts[0]
+    except Exception:
+        value = value.split()[0] if value.split() else value
+    return os.path.basename(value).lower()
+
+def first_exec(value):
+    value = (value or "").strip()
+    if not value:
+        return ""
+    try:
+        parts = shlex.split(value)
+        if parts:
+            return parts[0]
+    except Exception:
+        parts = value.split()
+        if parts:
+            return parts[0]
+    return ""
+
+def executable_exists(cmd):
+    exe = first_exec(cmd)
+    if not exe:
+        return False
+    if "/" in exe:
+        return Path(exe).exists() and os.access(exe, os.X_OK)
+    return has(exe)
+
+def is_valid_desktop_manager(cmd):
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return False
+    if cmd_base(cmd) in ("none", ""):
+        return True
+    return executable_exists(cmd)
+
+def default_options_for_desktop(role, cmd):
+    base = cmd_base(cmd)
+    defaults = {
+        ("x11-desktop-manager", "spacefm"): "--desktop",
+        ("x11-desktop-manager", "pcmanfm"): "--desktop",
+        ("x11-desktop-manager", "caja"): "",
+        ("x11-desktop-manager", "nemo"): "",
+        ("x11-desktop-manager", "mdeon-desktop"): "",
+        ("desktop-manager", "waylandminimal-desktop"): "",
+        ("desktop-manager", "mdeon-desktop"): "",
+        ("desktop-manager", "pcmanfm-qt"): "",
+        ("desktop-manager", "nemo"): "",
+        ("desktop-manager", "caja"): "",
+        ("desktop-manager", "spacefm"): "",
+    }
+    return defaults.get((role, base), "")
+
+def launch_detached(cmd, options=""):
+    if not cmd or cmd_base(cmd) == "none":
+        return
+    cmdline = f"{cmd} {options}".strip()
+    subprocess.Popen(
+        cmdline,
+        shell=True,
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+class Config:
+    def __init__(self):
+        self.data = {}
+        self.load()
+
+    def ensure_exists(self):
+        if CONF.exists():
+            return
+        CONF.parent.mkdir(parents=True, exist_ok=True)
+        if DFLT.exists():
+            shutil.copy(DFLT, CONF)
+            CONF.chmod(0o644)
+
+    def load(self):
+        self.ensure_exists()
+        src = CONF if CONF.exists() else DFLT
+        if not src.exists():
+            return
+        try:
+            for line in src.read_text(errors="ignore").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                key, value = stripped.split("=", 1)
+                self.data[key.strip()] = shell_unquote(value.strip())
+        except Exception:
+            pass
+
+    def get(self, key, default=""):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = str(value)
+
+    def save(self):
+        template = DFLT if DFLT.exists() else CONF
+        if template.exists():
+            lines = template.read_text(errors="ignore").splitlines()
+        else:
+            lines = []
+
+        written = set()
+        out = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                key = stripped.split("=", 1)[0].strip()
+                if key in self.data:
+                    out.append(f"{key}={quote_value(self.data[key])}")
+                    written.add(key)
+                else:
+                    out.append(line)
+            else:
+                out.append(line)
+
+        for key in sorted(self.data.keys()):
+            if key not in written:
+                out.append(f"{key}={quote_value(self.data[key])}")
+
+        CONF.parent.mkdir(parents=True, exist_ok=True)
+        CONF.write_text("\n".join(out) + "\n")
+
+# ----------------------------------------------------------------------
+# Core Cairo Desktop Dialog Controller
+# ----------------------------------------------------------------------
+class CairoDesktopDialog:
+    def __init__(self, candidates, initial_cmd="", initial_opts="", is_wayland=False, width=600, height=290, on_quit=None):
+        self.width = width
+        self.height = height
+        self.is_wayland = is_wayland
+        self.role = "desktop-manager" if is_wayland else "x11-desktop-manager"
+        self.cmd_key = "WAYLAND_DESKTOP_MANAGER" if is_wayland else "X11_DESKTOP_MANAGER"
+        self.opt_key = "WAYLAND_DESKTOP_MANAGER_OPTIONS" if is_wayland else "X11_DESKTOP_MANAGER_OPTIONS"
+        self.use_key = "WAYLAND_USE_DESKTOP_MANAGER" if is_wayland else "X11_USE_DESKTOP_MANAGER"
+
+        self.on_quit = on_quit or (lambda: sys.exit(0))
+        self.candidates = list(candidates)
+        if "none" not in self.candidates:
+            self.candidates.append("none")
+        if "Custom..." not in self.candidates:
+            self.candidates.append("Custom...")
+
+        # Select currently configured command or match candidate
+        if initial_cmd in self.candidates:
+            self.selected_idx = self.candidates.index(initial_cmd)
+            self.custom_cmd = ""
+        elif initial_cmd:
+            self.selected_idx = self.candidates.index("Custom...")
+            self.custom_cmd = initial_cmd
+        else:
+            self.selected_idx = 0
+            self.custom_cmd = ""
+
+        # Options management
+        if initial_opts:
+            self.options = initial_opts
+        else:
+            self.options = default_options_for_desktop(self.role, self.candidates[self.selected_idx]) if not self.is_custom() else ""
+
+        self.error_text = ""
+        self.dropdown_open = False
+        self.active_field = None
+        self.hovered_btn = None
+        self.hovered_drop_idx = -1
+
+        self.surface = cairo.ImageSurface(cairo.FORMAT_RGB24, self.width, self.height)
+        self.ctx = ThemedContext(cairo.Context(self.surface), prefers_light_scheme())
+        self.stride = self.surface.get_stride()
+        self.data_buffer = self.surface.get_data()
+        self.flush_cb = None
+        self.c_data = None
+        self.ximage = None
+
+    def set_flush_callback(self, cb):
+        self.flush_cb = cb
+
+    def is_custom(self):
+        return self.candidates[self.selected_idx] == "Custom..."
+
+    def selected_command(self):
+        if self.is_custom():
+            return self.custom_cmd.strip()
+        return self.candidates[self.selected_idx].strip()
+
+    def launch(self, save_as_default=False):
+        cmd = self.selected_command()
+        opts = self.options.strip()
+
+        if not is_valid_desktop_manager(cmd):
+            self.error_text = "Selected desktop manager is invalid or not installed."
+            self.redraw()
+            return
+
+        if save_as_default:
+            cfg = Config()
+            save_val = "" if cmd == "none" else cmd
+            cfg.set(self.cmd_key, save_val)
+            cfg.set(self.opt_key, opts)
+            cfg.set(self.use_key, "false" if cmd == "none" else "true")
+            cfg.save()
+
+        if cmd and cmd != "none":
+            try:
+                launch_detached(cmd, opts)
+            except Exception as e:
+                self.error_text = f"Launch failed: {e}"
+                self.redraw()
+                return
+
+        self.on_quit()
+
+    def _round_rect(self, x, y, w, h, r=4):
+        self.ctx.new_sub_path()
+        self.ctx.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        self.ctx.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        self.ctx.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        self.ctx.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        self.ctx.close_path()
+
+    def _get_layout(self):
+        return {
+            "dropdown": (20, 88, 250, 28),
+            "custom_entry": (280, 88, 300, 28),
+            "options_entry": (20, 150, 560, 28),
+            "cancel_btn": (240, 236, 80, 32),
+            "launch_btn": (330, 236, 110, 32),
+            "save_btn": (450, 236, 130, 32),
+        }
+
+    def redraw(self):
+        ctx = self.ctx
+        # Background
+        ctx.set_source_rgb(0.18, 0.18, 0.18)
+        ctx.paint()
+
+        # Border
+        ctx.set_source_rgb(0.28, 0.28, 0.28)
+        ctx.rectangle(0, 0, self.width, self.height)
+        ctx.set_line_width(1)
+        ctx.stroke()
+
+        # Title
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(13.5)
+        ctx.set_source_rgb(0.38, 0.68, 0.93)
+        ctx.move_to(20, 32)
+        sess_title = "Wayland" if self.is_wayland else "X11"
+        ctx.show_text(f"Launch Desktop Manager ({sess_title})")
+
+        # Description
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        ctx.set_font_size(11.0)
+        ctx.set_source_rgb(0.75, 0.75, 0.75)
+        ctx.move_to(20, 50)
+        ctx.show_text("Select a desktop manager and options. Launch once or set as your default.")
+
+        layout = self._get_layout()
+
+        # Section Labels
+        ctx.set_font_size(11.0)
+        ctx.set_source_rgb(0.85, 0.85, 0.85)
+        ctx.move_to(20, 80)
+        ctx.show_text("Desktop Manager")
+        ctx.move_to(20, 142)
+        ctx.show_text("Options / Flags")
+
+        # Dropdown
+        dx, dy, dw, dh = layout["dropdown"]
+        ctx.set_source_rgb(0.24, 0.24, 0.24)
+        self._round_rect(dx, dy, dw, dh, 4)
+        ctx.fill()
+        ctx.set_source_rgb(0.38, 0.38, 0.38)
+        self._round_rect(dx, dy, dw, dh, 4)
+        ctx.stroke()
+
+        ctx.set_source_rgb(0.95, 0.95, 0.95)
+        ctx.move_to(dx + 10, dy + 18)
+        ctx.show_text(self.candidates[self.selected_idx])
+        ctx.move_to(dx + dw - 20, dy + 18)
+        ctx.show_text("▼")
+
+        # Custom Entry
+        cx, cy, cw, ch = layout["custom_entry"]
+        is_cust = self.is_custom()
+        ctx.set_source_rgb(0.24 if is_cust else 0.16, 0.24 if is_cust else 0.16, 0.24 if is_cust else 0.16)
+        self._round_rect(cx, cy, cw, ch, 4)
+        ctx.fill()
+        ctx.set_source_rgb(*( (0.21, 0.52, 0.89) if self.active_field == "custom" and is_cust else (0.32, 0.32, 0.32) ))
+        self._round_rect(cx, cy, cw, ch, 4)
+        ctx.stroke()
+
+        if self.custom_cmd:
+            ctx.set_source_rgb(0.95, 0.95, 0.95)
+            ctx.move_to(cx + 8, cy + 18)
+            ctx.show_text(self.custom_cmd)
+        elif is_cust:
+            ctx.set_source_rgb(0.48, 0.48, 0.48)
+            ctx.move_to(cx + 8, cy + 18)
+            ctx.show_text("Custom command, e.g., spacefm")
+
+        # Options Entry
+        ox, oy, ow, oh = layout["options_entry"]
+        ctx.set_source_rgb(0.24, 0.24, 0.24)
+        self._round_rect(ox, oy, ow, oh, 4)
+        ctx.fill()
+        ctx.set_source_rgb(*( (0.21, 0.52, 0.89) if self.active_field == "options" else (0.32, 0.32, 0.32) ))
+        self._round_rect(ox, oy, ow, oh, 4)
+        ctx.stroke()
+
+        if self.options:
+            ctx.set_source_rgb(0.95, 0.95, 0.95)
+            ctx.move_to(ox + 8, oy + 18)
+            ctx.show_text(self.options)
+        else:
+            ctx.set_source_rgb(0.48, 0.48, 0.48)
+            ctx.move_to(ox + 8, oy + 18)
+            ctx.show_text("Options / flags (e.g. --desktop)")
+
+        # Error label
+        if self.error_text:
+            ctx.set_source_rgb(0.95, 0.35, 0.35)
+            ctx.move_to(20, 206)
+            ctx.show_text(self.error_text)
+
+        # Cancel
+        bx, by, bw, bh = layout["cancel_btn"]
+        ctx.set_source_rgb(*( (0.28, 0.28, 0.30) if self.hovered_btn == "cancel" else (0.22, 0.22, 0.24) ))
+        self._round_rect(bx, by, bw, bh, 4)
+        ctx.fill()
+        ctx.set_source_rgb(0.38, 0.38, 0.38)
+        self._round_rect(bx, by, bw, bh, 4)
+        ctx.stroke()
+        ctx.set_source_rgb(0.90, 0.90, 0.90)
+        ctx.move_to(bx + 18, by + 20)
+        ctx.show_text("Cancel")
+
+        # Launch Once
+        lx, ly, lw, lh = layout["launch_btn"]
+        ctx.set_source_rgb(*( (0.28, 0.28, 0.30) if self.hovered_btn == "launch" else (0.22, 0.22, 0.24) ))
+        self._round_rect(lx, ly, lw, lh, 4)
+        ctx.fill()
+        ctx.set_source_rgb(0.42, 0.42, 0.42)
+        self._round_rect(lx, ly, lw, lh, 4)
+        ctx.stroke()
+        ctx.set_source_rgb(0.95, 0.95, 0.95)
+        ctx.move_to(lx + 16, ly + 20)
+        ctx.show_text("Launch Once")
+
+        # Set as Default
+        sx, sy, sw, sh = layout["save_btn"]
+        ctx.set_source_rgb(*( (0.28, 0.60, 0.96) if self.hovered_btn == "save" else (0.21, 0.52, 0.89) ))
+        self._round_rect(sx, sy, sw, sh, 4)
+        ctx.fill()
+        ctx.set_source_rgb(0.35, 0.65, 0.98)
+        self._round_rect(sx, sy, sw, sh, 4)
+        ctx.stroke()
+        ctx.set_source_rgb(1.0, 1.0, 1.0)
+        ctx.move_to(sx + 18, sy + 20)
+        ctx.show_text("Set as Default")
+
+        # Dropdown Popup Overlay
+        if self.dropdown_open:
+            drop_h = len(self.candidates) * 24 + 6
+            ctx.set_source_rgb(0.20, 0.20, 0.20)
+            self._round_rect(dx, dy + dh + 2, dw, drop_h, 4)
+            ctx.fill()
+            ctx.set_source_rgb(0.40, 0.40, 0.40)
+            self._round_rect(dx, dy + dh + 2, dw, drop_h, 4)
+            ctx.stroke()
+
+            for i, cand in enumerate(self.candidates):
+                iy = dy + dh + 4 + (i * 24)
+                if i == self.hovered_drop_idx:
+                    ctx.set_source_rgb(0.21, 0.52, 0.89)
+                    self._round_rect(dx + 2, iy, dw - 4, 22, 3)
+                    ctx.fill()
+                    ctx.set_source_rgb(1.0, 1.0, 1.0)
+                else:
+                    ctx.set_source_rgb(0.90, 0.90, 0.90)
+                ctx.move_to(dx + 8, iy + 16)
+                ctx.show_text(cand)
+
+        self.surface.flush()
+        if self.flush_cb:
+            self.flush_cb()
+
+    def handle_click(self, x, y, button):
+        if button != 1:
+            return
+        layout = self._get_layout()
+        dx, dy, dw, dh = layout["dropdown"]
+
+        if self.dropdown_open:
+            drop_h = len(self.candidates) * 24 + 6
+            if dx <= x <= dx + dw and dy + dh <= y <= dy + dh + drop_h:
+                idx = (y - (dy + dh + 4)) // 24
+                if 0 <= idx < len(self.candidates):
+                    self.selected_idx = idx
+                    self.dropdown_open = False
+                    chosen = self.candidates[idx]
+                    if chosen == "Custom...":
+                        self.active_field = "custom"
+                    else:
+                        self.active_field = None
+                        self.options = default_options_for_desktop(self.role, chosen)
+                    self.error_text = ""
+                    self.redraw()
+                    return
+            self.dropdown_open = False
+            self.redraw()
+            return
+
+        if dx <= x <= dx + dw and dy <= y <= dy + dh:
+            self.dropdown_open = True
+            self.redraw()
+            return
+
+        cx, cy, cw, ch = layout["custom_entry"]
+        if self.is_custom() and cx <= x <= cx + cw and cy <= y <= cy + ch:
+            self.active_field = "custom"
+            self.redraw()
+            return
+
+        ox, oy, ow, oh = layout["options_entry"]
+        if ox <= x <= ox + ow and oy <= y <= oy + oh:
+            self.active_field = "options"
+            self.redraw()
+            return
+
+        bx, by, bw, bh = layout["cancel_btn"]
+        if bx <= x <= bx + bw and by <= y <= by + bh:
+            self.on_quit()
+            return
+
+        lx, ly, lw, lh = layout["launch_btn"]
+        if lx <= x <= lx + lw and ly <= y <= ly + lh:
+            self.launch(save_as_default=False)
+            return
+
+        sx, sy, sw, sh = layout["save_btn"]
+        if sx <= x <= sx + sw and sy <= y <= sy + sh:
+            self.launch(save_as_default=True)
+            return
+
+        self.active_field = None
+        self.redraw()
+
+    def handle_motion(self, x, y):
+        layout = self._get_layout()
+        changed = False
+
+        if self.dropdown_open:
+            dx, dy, dw, dh = layout["dropdown"]
+            drop_h = len(self.candidates) * 24 + 6
+            if dx <= x <= dx + dw and dy + dh <= y <= dy + dh + drop_h:
+                idx = (y - (dy + dh + 4)) // 24
+                if idx != self.hovered_drop_idx:
+                    self.hovered_drop_idx = idx
+                    changed = True
+            else:
+                if self.hovered_drop_idx != -1:
+                    self.hovered_drop_idx = -1
+                    changed = True
+        else:
+            bx, by, bw, bh = layout["cancel_btn"]
+            lx, ly, lw, lh = layout["launch_btn"]
+            sx, sy, sw, sh = layout["save_btn"]
+            hover = None
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                hover = "cancel"
+            elif lx <= x <= lx + lw and ly <= y <= ly + lh:
+                hover = "launch"
+            elif sx <= x <= sx + sw and sy <= y <= sy + sh:
+                hover = "save"
+
+            if hover != self.hovered_btn:
+                self.hovered_btn = hover
+                changed = True
+
+        if changed:
+            self.redraw()
+
+    def handle_key(self, keysym, state):
+        if keysym == 0xff1b:  # Escape
+            if self.dropdown_open:
+                self.dropdown_open = False
+                self.redraw()
+            else:
+                self.on_quit()
+            return
+
+        if keysym in (0xff0d, 0xff8d):  # Return / Enter
+            self.launch(save_as_default=True)
+            return
+
+        if keysym == 0xff09:  # Tab
+            if self.is_custom():
+                self.active_field = "options" if self.active_field == "custom" else "custom"
+            else:
+                self.active_field = "options"
+            self.redraw()
+            return
+
+        if keysym == 0xff08:  # BackSpace
+            if self.active_field == "custom" and self.is_custom():
+                self.custom_cmd = self.custom_cmd[:-1]
+                self.redraw()
+            elif self.active_field == "options":
+                self.options = self.options[:-1]
+                self.redraw()
+            return
+
+        if 0x20 <= keysym <= 0x7E:  # Printable ASCII
+            ch = chr(keysym)
+            if self.active_field == "custom" and self.is_custom():
+                self.custom_cmd += ch
+                self.redraw()
+            elif self.active_field == "options":
+                self.options += ch
+                self.redraw()
+
+# ----------------------------------------------------------------------
+# Complete 64-Bit Safe X11 Backend
+# ----------------------------------------------------------------------
+x11 = None
+try:
+    x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XDefaultScreen.restype = ctypes.c_int
+    x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+    x11.XRootWindow.restype = ctypes.c_ulong
+    x11.XRootWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDefaultVisual.restype = ctypes.c_void_p
+    x11.XDefaultVisual.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDefaultDepth.restype = ctypes.c_int
+    x11.XDefaultDepth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDisplayWidth.restype = ctypes.c_int
+    x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDisplayHeight.restype = ctypes.c_int
+    x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XCreateSimpleWindow.restype = ctypes.c_ulong
+    x11.XCreateSimpleWindow.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_ulong
+    ]
+    x11.XCreateGC.restype = ctypes.c_void_p
+    x11.XCreateGC.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+    x11.XCreateImage.restype = ctypes.c_void_p
+    x11.XCreateImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_int,
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int
+    ]
+    x11.XPutImage.restype = ctypes.c_int
+    x11.XPutImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint
+    ]
+    x11.XSelectInput.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long]
+    x11.XMapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XPending.restype = ctypes.c_int
+    x11.XPending.argtypes = [ctypes.c_void_p]
+    x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XChangeProperty.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int
+    ]
+    x11.XKeycodeToKeysym.restype = ctypes.c_ulong
+    x11.XKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int]
+    x11.XStoreName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_char_p]
+except Exception:
+    x11 = None
+
+class XEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("pad", ctypes.c_long * 24)]
+
+class XButtonEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint), ("button", ctypes.c_uint), ("same_screen", ctypes.c_int)
+    ]
+
+class XMotionEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint), ("is_hint", ctypes.c_char), ("same_screen", ctypes.c_int)
+    ]
+
+class XKeyEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int), ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint), ("keycode", ctypes.c_uint), ("same_screen", ctypes.c_int)
+    ]
+
+def run_x11(candidates, initial_cmd, initial_opts):
+    if not x11:
+        raise RuntimeError("libX11.so.6 could not be loaded")
+
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise RuntimeError("Failed to open X11 Display")
+
+    screen = x11.XDefaultScreen(display)
+    root = x11.XRootWindow(display, screen)
+    visual = x11.XDefaultVisual(display, screen)
+    depth = x11.XDefaultDepth(display, screen)
+    sw = x11.XDisplayWidth(display, screen)
+    sh = x11.XDisplayHeight(display, screen)
+
+    width, height = 600, 290
+    x = max(0, (sw - width) // 2)
+    y = max(0, (sh - height) // 2)
+
+    win = x11.XCreateSimpleWindow(display, root, x, y, width, height, 0, 0, 0x1e1e1e)
+    gc = x11.XCreateGC(display, win, 0, None)
+
+    x11.XStoreName(display, win, b"launch-desktop")
+    atom_class = x11.XInternAtom(display, b"WM_CLASS", 0)
+    x11.XChangeProperty(display, win, atom_class, 31, 8, 0, b"launch-desktop\0launch-desktop\0", 30)
+
+    atom_type = x11.XInternAtom(display, b"_NET_WM_WINDOW_TYPE", 0)
+    atom_dialog = x11.XInternAtom(display, b"_NET_WM_WINDOW_TYPE_DIALOG", 0)
+    x11.XChangeProperty(display, win, atom_type, 4, 32, 0, (ctypes.c_ulong * 1)(atom_dialog), 1)
+
+    x11.XSelectInput(display, win, (1 << 15) | (1 << 2) | (1 << 0) | (1 << 6))
+    x11.XMapWindow(display, win)
+    x11.XFlush(display)
+
+    app = CairoDesktopDialog(candidates, initial_cmd, initial_opts, is_wayland=False, width=width, height=height, on_quit=lambda: sys.exit(0))
+    app.c_data = (ctypes.c_char * (app.stride * height)).from_buffer(app.data_buffer)
+    app.ximage = x11.XCreateImage(
+        display, visual, depth, 2, 0, ctypes.cast(app.c_data, ctypes.c_void_p), width, height, 32, app.stride
+    )
+
+    def flush():
+        x11.XPutImage(display, win, gc, app.ximage, 0, 0, 0, 0, width, height)
+        x11.XFlush(display)
+
+    app.set_flush_callback(flush)
+    app.redraw()
+
+    ev = XEvent()
+    while True:
+        while x11.XPending(display):
+            x11.XNextEvent(display, ctypes.byref(ev))
+            if ev.type == 12:  # Expose
+                app.redraw()
+            elif ev.type == 6:  # MotionNotify
+                mev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XMotionEvent)).contents
+                app.handle_motion(mev.x, mev.y)
+            elif ev.type == 4:  # ButtonPress
+                bev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XButtonEvent)).contents
+                app.handle_click(bev.x, bev.y, bev.button)
+            elif ev.type == 2:  # KeyPress
+                kev = ctypes.cast(ctypes.byref(ev), ctypes.POINTER(XKeyEvent)).contents
+                keysym = x11.XKeycodeToKeysym(display, kev.keycode, 0)
+                app.handle_key(keysym, kev.state)
+        time.sleep(0.015)
+
+# ----------------------------------------------------------------------
+# Wayland Backend (pywayland layer-shell)
+# ----------------------------------------------------------------------
+HAVE_WAYLAND = False
+if os.environ.get("WAYLAND_DISPLAY"):
+    try:
+        from pywayland.client import Display as WlDisplay
+        from pywayland.protocols.wayland import WlCompositor, WlShm, WlSeat
+        from pywayland.protocols.wlr_layer_shell_unstable_v1 import ZwlrLayerShellV1
+        HAVE_WAYLAND = True
+    except Exception:
+        HAVE_WAYLAND = False
+
+try:
+    xkb = ctypes.cdll.LoadLibrary("libxkbcommon.so.0")
+    xkb.xkb_context_new.restype = ctypes.c_void_p
+    xkb.xkb_state_key_get_one_sym.restype = ctypes.c_uint32
+    xkb.xkb_state_key_get_one_sym.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+except OSError:
+    xkb = None
+
+def run_wayland(candidates, initial_cmd, initial_opts):
+    if not HAVE_WAYLAND:
+        raise RuntimeError("Native Wayland layer shell requested but pywayland is not available")
+
+    wl_display = WlDisplay()
+    wl_display.connect()
+    registry = wl_display.get_registry()
+
+    state = {
+        "compositor": None, "shm": None, "layer_shell": None,
+        "seat": None, "seat_global": None, "keyboard": None, "pointer": None,
+        "xkb_context": xkb.xkb_context_new(0) if xkb else None, "xkb_state": None,
+    }
+
+    def registry_global(reg, id_, interface, version):
+        if interface == "wl_compositor":
+            state["compositor"] = reg.bind(id_, WlCompositor, min(version, 4))
+        elif interface == "wl_shm":
+            state["shm"] = reg.bind(id_, WlShm, 1)
+        elif interface == "zwlr_layer_shell_v1":
+            state["layer_shell"] = reg.bind(id_, ZwlrLayerShellV1, min(version, 4))
+        elif interface == "wl_seat":
+            state["seat_global"] = (id_, min(version, 7))
+
+    registry.dispatcher["global"] = registry_global
+    wl_display.roundtrip()
+
+    if not state["layer_shell"] or not state["compositor"] or not state["shm"]:
+        raise RuntimeError("Compositor lacks required layer_shell or shm interfaces")
+
+    width, height = 600, 290
+    app = CairoDesktopDialog(candidates, initial_cmd, initial_opts, is_wayland=True, width=width, height=height, on_quit=lambda: sys.exit(0))
+
+    surface = state["compositor"].create_surface()
+    layer_surface = state["layer_shell"].get_layer_surface(surface, None, 3, "launch-desktop")
+    layer_surface.set_size(width, height)
+    layer_surface.set_anchor(0)
+    layer_surface.set_keyboard_interactivity(1)
+
+    pointer_pos = [0, 0]
+
+    def pointer_motion(_p, _time, sx, sy):
+        pointer_pos[:] = [int(sx), int(sy)]
+        app.handle_motion(*pointer_pos)
+
+    def pointer_button(_p, _serial, _time, button, bstate):
+        if bstate != 1:
+            return
+        btn_map = {272: 1, 273: 3, 274: 2}
+        mapped = btn_map.get(button)
+        if mapped:
+            app.handle_click(pointer_pos[0], pointer_pos[1], mapped)
+
+    def keyboard_key(_kbd, _serial, _time, key, kstate):
+        if kstate != 1 or not state["xkb_state"]:
+            return
+        keysym = xkb.xkb_state_key_get_one_sym(state["xkb_state"], key + 8)
+        app.handle_key(keysym, 0)
+
+    def seat_capabilities(_seat, caps):
+        if caps & 1 and state["pointer"] is None:
+            p = state["seat"].get_pointer()
+            p.dispatcher["motion"] = pointer_motion
+            p.dispatcher["button"] = pointer_button
+            state["pointer"] = p
+        if caps & 2 and state["keyboard"] is None:
+            k = state["seat"].get_keyboard()
+            k.dispatcher["key"] = keyboard_key
+            state["keyboard"] = k
+
+    if state["seat_global"]:
+        sid, svers = state["seat_global"]
+        state["seat"] = registry.bind(sid, WlSeat, svers)
+        state["seat"].dispatcher["capabilities"] = seat_capabilities
+
+    stride = width * 4
+    size = stride * height
+    fd = os.memfd_create("launch-desktop", os.MFD_CLOEXEC) if hasattr(os, "memfd_create") else tempfile.TemporaryFile().fileno()
+    os.ftruncate(fd, size)
+    mapped = mmap.mmap(fd, size, access=mmap.ACCESS_WRITE)
+    pool = state["shm"].create_pool(fd, size)
+    buf = pool.create_buffer(0, width, height, stride, WlShm.format.xrgb8888)
+    pool.destroy()
+
+    def present():
+        data = bytes(app.data_buffer)
+        mapped[:len(data)] = data
+        mapped.flush()
+        surface.attach(buf, 0, 0)
+        surface.damage(0, 0, width, height)
+        surface.commit()
+        wl_display.flush()
+
+    app.set_flush_callback(present)
+
+    def on_configure(_layer, serial, _w, _h):
+        layer_surface.ack_configure(serial)
+        app.redraw()
+
+    layer_surface.dispatcher["configure"] = on_configure
+    surface.commit()
+    wl_display.roundtrip()
+
+    while True:
+        if select.select([wl_display.get_fd()], [], [], 0.5)[0]:
+            wl_display.dispatch(block=True)
+
+# ----------------------------------------------------------------------
+# Main Entrypoint
+# ----------------------------------------------------------------------
+def main():
+    cfg = Config()
+    sess = session_type()
+    is_wayland = (sess == "wayland")
+
+    if is_wayland:
+        cmd_key = "WAYLAND_DESKTOP_MANAGER"
+        opt_key = "WAYLAND_DESKTOP_MANAGER_OPTIONS"
+        candidates = available(WAYLAND_DESKTOP_CANDIDATES)
+    else:
+        cmd_key = "X11_DESKTOP_MANAGER"
+        opt_key = "X11_DESKTOP_MANAGER_OPTIONS"
+        candidates = available(X11_DESKTOP_CANDIDATES)
+
+    cmd = cfg.get(cmd_key, "").strip()
+    options = cfg.get(opt_key, "").strip()
+
+    # Always present GUI selector like launch-panel does
+    if is_wayland and HAVE_WAYLAND:
+        try:
+            run_wayland(candidates, cmd, options)
+            return 0
+        except Exception:
+            pass
+
+    run_x11(candidates, cmd, options)
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,18 @@
+Package: mdeon
+Version: 2026-07-19
+Section: x11
+Priority: optional
+Architecture: all
+Maintainer: roy <roy@example.com>
+Replaces: minimal-session-common, minimal-wayland-session, minimal-x-session
+Conflicts: minimal-session-common, minimal-wayland-session, minimal-x-session
+Provides: minimal-session-common, minimal-wayland-session, minimal-x-session
+Depends: dbus-user-session | dbus-x11, fontconfig, gir1.2-glib-2.0, gir1.2-gtk4layershell-1.0, gir1.2-gtklayershell-0.1, gsettings-desktop-schemas, mousepad, python3, python3-cairo, python3-gi, python3-pywayland, qt5-gtk-platformtheme, qt6-gtk-platformtheme, roy-commands, roy-debian-system-adjustments2, thunar | navigational-file-manager, xdg-desktop-portal, xdg-desktop-portal-gtk | xdg-desktop-portal-wlr, xdg-utils, xfce-polkit | lxpolkit | mate-polkit | policykit-1-gnome, xfce4-notifyd, xfce4-power-manager, xfce4-terminal | x-terminal-emulator
+Recommends: gnome-keyring, labwc | wayfire | sway | kwin-wayland, libwayland-client0, qt6-wayland, swaybg, swayidle, swaylock, wdisplays | nwg-displays, wlr-randr, xwayland, arandr | lxrandr, wmctrl, x11-utils, x11-xserver-utils, xfconf, xfwm4 | flwm | x-window-manager, xsettingsd, xwallpaper, indicator-notifications, pamixer, pasystray, thunar-archive-plugin, thunar-custom-actions, thunar-volman
+Suggests: foot, tint2, tmenu | rofi | jgmenu, wl-clipboard, wlopm, kscreen, kdeadmin
+Description: Lightweight desktop environment optimized for needs
+ MDEON provides a lightweight, modular desktop environment setup
+ supporting both X11 and Wayland minimal sessions with Cairo-rendered tools.
+ .
+ This package replaces the minimal-session-common, minimal-wayland-session,
+ and minimal-x-session packages.
